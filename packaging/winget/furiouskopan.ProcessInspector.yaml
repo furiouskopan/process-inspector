@@ -1,6 +1,6 @@
-﻿# Submit to https://github.com/microsoft/winget-pkgs under manifests/f/furiouskopan/ProcessInspector/1.2.0/
+﻿# Submit to https://github.com/microsoft/winget-pkgs under manifests/f/furiouskopan/ProcessInspector/1.2.1/
 PackageIdentifier: furiouskopan.ProcessInspector
-PackageVersion: 1.2.0
+PackageVersion: 1.2.1
 PackageName: Process Inspector
 Publisher: furiouskopan
 License: MIT
@@ -16,8 +16,8 @@ Installers:
 - Architecture: x64
   InstallerType: exe
   Scope: user
-  InstallerUrl: https://github.com/furiouskopan/process-inspector/releases/download/v1.2.0/ProcessInspector-Setup.exe
-  InstallerSha256: 701F1E68CD8B9D6BD4013BFD1D599A477459CCCC7B2D4CA22D48F59220D2D2D6
+  InstallerUrl: https://github.com/furiouskopan/process-inspector/releases/download/v1.2.1/ProcessInspector-Setup.exe
+  InstallerSha256: 0E47BF30A7BB735264EF94053CB13D22F9A442B8A92F1B2977F6C7E62045B23B
   InstallerSwitches:
     Silent: -Silent -NoLaunch
     SilentWithProgress: -Silent -NoLaunch

@@ -23,7 +23,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not ('WhosLocking.HandleEnum' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'HandleEnum.cs') }
+if (-not ('WhosLocking.HandleEnum' -as [type])) {
+    $dll = Join-Path $PSScriptRoot 'ProcessInspector.Native.dll'
+    if (Test-Path $dll) { Add-Type -AssemblyName PresentationCore, WindowsBase; Add-Type -Path $dll }
+    else { Add-Type -Path (Join-Path $PSScriptRoot 'HandleEnum.cs') }
+}
 
 $names = @{}
 Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $names[[int]$_.Id] = $_.ProcessName }

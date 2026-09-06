@@ -1,10 +1,10 @@
 ﻿{
-    "version": "1.2.0",
+    "version": "1.2.1",
     "description": "See what every process is used by, which files it has open, and who is locking a file.",
     "homepage": "https://github.com/furiouskopan/process-inspector",
     "license": "MIT",
-    "url": "https://github.com/furiouskopan/process-inspector/releases/download/v1.2.0/ProcessInspector-portable.zip",
-    "hash": "9cd3467cf208e661c1fcfeb0802ed9d6f4a1f54774b7ce08a6b2bd73085a7177",
+    "url": "https://github.com/furiouskopan/process-inspector/releases/download/v1.2.1/ProcessInspector-portable.zip",
+    "hash": "cd7073de520a950d9c6678f6f299331e2cd882897575b97f5d671a86afabbc59",
     "bin": "ProcessInspector.exe",
     "shortcuts": [ [ "ProcessInspector.exe", "Process Inspector" ] ],
     "checkver": "github",

@@ -14,11 +14,22 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("See what every process is used by, which files it has open, and who is locking a file.")]
 [assembly: AssemblyProduct("Process Inspector")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 static class Program
 {
+    static void Log(string text)
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessInspector");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "error.log"), "[" + DateTime.Now.ToString("s") + "] host: " + text + Environment.NewLine + Environment.NewLine);
+        }
+        catch { }
+    }
+
     [STAThread]
     static int Main(string[] args)
     {
@@ -68,7 +79,9 @@ static class Program
                             if (e.InvocationInfo != null) msg.AppendLine(e.InvocationInfo.PositionMessage);
                             msg.AppendLine();
                         }
-                        MessageBox.Show(msg.ToString(), "Process Inspector - error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        Log(msg.ToString());
+                        MessageBox.Show(msg.ToString() + "\nDetails were written to %LOCALAPPDATA%\\ProcessInspector\\error.log",
+                                        "Process Inspector - error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         return 2;
                     }
                 }
@@ -77,7 +90,9 @@ static class Program
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.ToString(), "Process Inspector - error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log(ex.ToString());
+            MessageBox.Show(ex.ToString() + "\nDetails were written to %LOCALAPPDATA%\\ProcessInspector\\error.log",
+                            "Process Inspector - error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 3;
         }
     }

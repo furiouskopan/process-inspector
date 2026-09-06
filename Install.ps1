@@ -27,9 +27,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $AppName = 'Process Inspector'
-$Version = '1.2.0'
+$Version = '1.2.1'
 $Dest    = Join-Path $env:LOCALAPPDATA 'Programs\ProcessInspector'
-$Files   = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','SysMetrics.cs','app.ico',
+$Files   = 'ProcessInspector.exe','ProcessInspector.Native.dll','ProcessInspector.ps1','Native.cs','HandleEnum.cs','SysMetrics.cs','app.ico',
            'WhosLocking.ps1','ListProcesses.ps1','OpenFiles.ps1',
            'Install.ps1','Uninstall.ps1','README.md','LICENSE'
 $Stale   = 'ProcessInspector.cmd','WhosLocking.cmd','ListProcesses.cmd','Install-ContextMenu.ps1'   # from older versions

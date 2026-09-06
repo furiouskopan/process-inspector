@@ -31,7 +31,7 @@ $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Wind
                   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:AppRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:ExePath = $env:PROCESS_INSPECTOR_EXE          # set by ProcessInspector.exe when hosting this script
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $script:RepoOwner  = 'furiouskopan'          # used by "Check for updates"
 $script:RepoName   = 'process-inspector'
 $script:CpuPrev       = @{}    # pid -> @{Cpu; Io; Time}  for the CPU % / Disk columns
@@ -67,127 +67,17 @@ if (-not $SelfTest) {
 # =============================================================================
 # Native helpers + row types
 # =============================================================================
+# Prebuilt DLL when available (fast start); otherwise compile the sources on the fly.
+$script:NativeDll = Join-Path $AppRoot 'ProcessInspector.Native.dll'
 if (-not ('WhosLocking.RestartManager' -as [type])) {
-$wpfRefs = @([System.Windows.Media.ImageSource].Assembly.Location, [System.Windows.DependencyObject].Assembly.Location,
-             [System.Uri].Assembly.Location)
-Add-Type -ReferencedAssemblies $wpfRefs -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-
-namespace WhosLocking {
-
-public class ProcRow {
-    public System.Windows.Media.ImageSource Icon { get; set; }
-    public int      PID          { get; set; }
-    public string   Name         { get; set; }
-    public string   Description  { get; set; }
-    public string   Company      { get; set; }
-    public string   User         { get; set; }
-    public string   Parent       { get; set; }
-    public int      ParentPID    { get; set; }
-    public string   Services     { get; set; }   // display labels
-    public string   ServiceNames { get; set; }   // short names, comma separated
-    public string   UsedBy       { get; set; }
-    public double   MemoryMB     { get; set; }
-    public double   CpuPercent   { get; set; }
-    public double   DiskKBs      { get; set; }
-    public int      Threads      { get; set; }
-    public int      Handles      { get; set; }
-    public string   Status       { get; set; }   // "", "New", "Exited"
-    public string   Signer       { get; set; }
-    public DateTime? Started     { get; set; }
-    public string   Path         { get; set; }
-    public string   CommandLine  { get; set; }
-}
-
-public class LockRow {
-    public System.Windows.Media.ImageSource Icon { get; set; }
-    public int      PID          { get; set; }
-    public string   Name         { get; set; }
-    public string   Description  { get; set; }
-    public string   Type         { get; set; }
-    public string   ServiceNames { get; set; }
-    public string   User         { get; set; }
-    public DateTime? Started     { get; set; }
-    public string   Path         { get; set; }
-    public string   HeldItem     { get; set; }
-    public List<long> Handles    { get; set; }   // handle values we could close remotely
-    public LockRow() { Handles = new List<long>(); }
-}
-
-public static class ProcUser {
-    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr tok);
-    public static string Get(int pid) {
-        IntPtr h = OpenProcess(0x1000, false, pid);
-        if (h == IntPtr.Zero) return null;
-        try {
-            IntPtr tok;
-            if (!OpenProcessToken(h, 0x0008, out tok)) return null;
-            try { using (var id = new System.Security.Principal.WindowsIdentity(tok)) return id.Name; }
-            finally { CloseHandle(tok); }
-        } finally { CloseHandle(h); }
+    if (Test-Path $NativeDll) {
+        Add-Type -Path $NativeDll
+    } else {
+        $wpfRefs = @([System.Windows.Media.ImageSource].Assembly.Location, [System.Windows.DependencyObject].Assembly.Location, [System.Uri].Assembly.Location)
+        Add-Type -Path (Join-Path $AppRoot 'Native.cs'), (Join-Path $AppRoot 'HandleEnum.cs'), (Join-Path $AppRoot 'SysMetrics.cs') -ReferencedAssemblies $wpfRefs
     }
 }
 
-public static class RestartManager {
-    [StructLayout(LayoutKind.Sequential)]
-    struct RM_UNIQUE_PROCESS { public int dwProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct RM_PROCESS_INFO {
-        public RM_UNIQUE_PROCESS Process;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]  public string strServiceShortName;
-        public int ApplicationType; public uint AppStatus; public uint TSSessionId;
-        [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
-    }
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
-    [DllImport("rstrtmgr.dll")]
-    static extern int RmEndSession(uint pSessionHandle);
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
-        uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
-    [DllImport("rstrtmgr.dll")]
-    static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo,
-        [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
-
-    public class Locker { public int Pid; public string AppName; public string ServiceName; public int AppType; }
-
-    public static List<Locker> Find(string[] files) {
-        var result = new List<Locker>();
-        uint session;
-        int rc = RmStartSession(out session, 0, Guid.NewGuid().ToString("N"));
-        if (rc != 0) throw new Exception("RmStartSession failed (" + rc + ")");
-        try {
-            rc = RmRegisterResources(session, (uint)files.Length, files, 0, null, 0, null);
-            if (rc != 0) throw new Exception("RmRegisterResources failed (" + rc + ")");
-            uint needed = 0, count = 0, reasons = 0;
-            rc = RmGetList(session, out needed, ref count, null, ref reasons);
-            while (rc == 234) {
-                var buf = new RM_PROCESS_INFO[needed];
-                count = needed;
-                rc = RmGetList(session, out needed, ref count, buf, ref reasons);
-                if (rc == 0)
-                    for (int i = 0; i < count; i++)
-                        result.Add(new Locker { Pid = buf[i].Process.dwProcessId, AppName = buf[i].strAppName,
-                                                ServiceName = buf[i].strServiceShortName, AppType = buf[i].ApplicationType });
-            }
-            if (rc != 0) throw new Exception("RmGetList failed (" + rc + ")");
-        } finally { RmEndSession(session); }
-        return result;
-    }
-}
-}
-'@
-}
-
-if (-not ('WhosLocking.HandleEnum' -as [type])) { Add-Type -Path (Join-Path $AppRoot 'HandleEnum.cs') }
-if (-not ('WhosLocking.SysMetrics' -as [type])) { Add-Type -Path (Join-Path $AppRoot 'SysMetrics.cs') }
 
 # 16 px icon of an exe, cached per path (null when it cannot be read).
 function Get-ExeIcon([string]$path) {
@@ -210,7 +100,7 @@ function Get-ExeIcon([string]$path) {
 # =============================================================================
 # Data functions
 # =============================================================================
-function Get-ProcessRows {
+function Get-ProcessRows([switch]$KeepExited) {
     # only the properties we use: measurably faster than the full instance
     $cim   = Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, ParentProcessId, ExecutablePath, CommandLine,
                  CreationDate, WorkingSetSize, ThreadCount, HandleCount, ReadTransferCount, WriteTransferCount
@@ -295,16 +185,21 @@ function Get-ProcessRows {
         $list.Add($r)
         $liveRows[$pid_] = $r
     }
-    # processes that disappeared since the previous refresh: shown once more, greyed out
-    foreach ($k in $script:PrevRows.Keys) {
-        if (-not $liveRows.ContainsKey($k)) {
-            $old = $script:PrevRows[$k]
-            $old.Status = 'Exited'; $old.CpuPercent = 0; $old.DiskKBs = 0
-            $list.Add($old)
+    # processes that disappeared since the previous refresh: shown once more, greyed out, but only in
+    # the live (auto-refresh) view - after a manual refresh or an End process they must be gone
+    if ($KeepExited) {
+        foreach ($k in $script:PrevRows.Keys) {
+            if (-not $liveRows.ContainsKey($k)) {
+                $old = $script:PrevRows[$k]
+                $old.Status = 'Exited'; $old.CpuPercent = 0; $old.DiskKBs = 0
+                $list.Add($old)
+            }
         }
     }
     $script:PrevRows = $liveRows
     $script:CpuPrev  = $cpuNow
+    # Process objects hold a kernel handle each once touched: release them now instead of at GC time
+    foreach ($x in $procs.Values) { try { $x.Dispose() } catch {} }
     return ,$list
 }
 
@@ -443,37 +338,76 @@ function Get-OpenFileRows([int]$pid_, [bool]$includeModules, [hashtable]$names) 
 $criticalNames = 'csrss','wininit','winlogon','smss','services','lsass','System','Idle','Registry','Memory Compression','svchost'
 
 function Stop-Targets($items) {
-    # $items: objects with PID, Name, ServiceNames
-    $items = @($items)
-    if ($items.Count -eq 0) { Show-Status 'Nothing selected.'; return $false }
+    # $items: objects with PID, Name, ServiceNames (and Status for process rows)
+    $items = @($items | Where-Object { $_ -and $_.Status -ne 'Exited' })
+    if ($items.Count -eq 0) { Show-Status 'Nothing selected, or it has already exited.'; return $false }
     $desc = ($items | ForEach-Object {
         $s = "$($_.Name)  (PID $($_.PID))"
         if ($_.ServiceNames) { $s += "   -> will STOP service(s): $($_.ServiceNames)" }
         $s }) -join "`n"
-    $ans = [System.Windows.MessageBox]::Show("End the following?`n`n$desc", 'Confirm', 'YesNo', 'Warning')
-    if ($ans -ne 'Yes') { return $false }
 
-    $problems = @()
-    foreach ($it in $items) {
-        $base = [IO.Path]::GetFileNameWithoutExtension($it.Name)
-        if ($criticalNames -contains $base -and -not $it.ServiceNames) {
-            $problems += "Skipped critical system process $($it.Name) ($($it.PID))."; continue
-        }
-        try {
-            if ($it.ServiceNames) {
-                foreach ($svc in ($it.ServiceNames -split ',')) { Stop-Service -Name $svc.Trim() -Force -ErrorAction Stop }
-            } else {
-                Stop-Process -Id $it.PID -Force -ErrorAction Stop
+    $wasAuto = $AutoTimer.IsEnabled; $AutoTimer.Stop()     # no list churn underneath the dialogs
+    try {
+        $ans = [System.Windows.MessageBox]::Show("End the following?`n`n$desc", 'Confirm', 'YesNo', 'Warning')
+        if ($ans -ne 'Yes') { return $false }
+
+        $problems = @(); $denied = $false; $killed = @()
+        foreach ($it in $items) {
+            $base = [IO.Path]::GetFileNameWithoutExtension($it.Name)
+            if ($criticalNames -contains $base -and -not $it.ServiceNames) {
+                $problems += "Skipped critical system process $($it.Name) ($($it.PID)) - ending it would crash or lock Windows."; continue
             }
-        } catch {
-            $m = $_.Exception.Message
-            if (-not $script:IsAdmin) { $m += "  (try Restart as Administrator)" }
-            $problems += "$($it.Name) ($($it.PID)): $m"
+            try {
+                if ($it.ServiceNames) {
+                    $failed = @()
+                    foreach ($svc in ($it.ServiceNames -split ',')) {
+                        try { Stop-Service -Name $svc.Trim() -Force -ErrorAction Stop } catch { $failed += "$($svc.Trim()): $($_.Exception.Message)" }
+                    }
+                    if ($failed) {
+                        $ans2 = [System.Windows.MessageBox]::Show(
+                            "The service did not stop:`n$($failed -join "`n")`n`nForce-end the hosting process $($it.Name) (PID $($it.PID)) instead?`n(Any other service living in the same process ends too.)",
+                            'Service refused to stop', 'YesNo', 'Warning')
+                        if ($ans2 -ne 'Yes') { $problems += $failed; continue }
+                        Stop-Process -Id $it.PID -Force -ErrorAction Stop
+                    }
+                } else {
+                    Stop-Process -Id $it.PID -Force -ErrorAction Stop
+                }
+                $killed += [int]$it.PID
+            } catch {
+                $m = $_.Exception.Message
+                if ($m -match 'denied|not permitted|privilege|Access') { $denied = $true }
+                $problems += "$($it.Name) ($($it.PID)): $m"
+            }
         }
+
+        # wait until they are really gone (up to 3 s), so the list does not show them as still running
+        if ($killed.Count) {
+            Show-Status 'Waiting for the process to exit...'
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            while ($sw.Elapsed.TotalSeconds -lt 3 -and @($killed | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count) { Start-Sleep -Milliseconds 150 }
+            foreach ($k in $killed) {
+                if (Get-Process -Id $k -ErrorAction SilentlyContinue) { $problems += "PID $k is still running 3 s after being told to end. It is protected, or a parent process restarted it." }
+                $script:PrevRows.Remove($k)          # never show it as a lingering red row
+            }
+        }
+
+        if ($problems) {
+            $text = $problems -join "`n"
+            if ($denied -and -not $IsAdmin) {
+                $ans3 = [System.Windows.MessageBox]::Show("$text`n`nWindows refused: the process belongs to another user or runs elevated. Restart Process Inspector as Administrator and try again?",
+                    'Access denied', 'YesNo', 'Warning')
+                if ($ans3 -eq 'Yes') { Restart-Elevated $ui.txtPath.Text; return $true }
+            } else {
+                [System.Windows.MessageBox]::Show($text, 'Some items could not be ended', 'OK', 'Warning') | Out-Null
+            }
+        } elseif ($killed.Count) {
+            Show-Status "Ended: $(($items | ForEach-Object { $_.Name }) -join ', ')"
+        }
+        return $true
+    } finally {
+        if ($wasAuto -and $ui.chkAutoRefresh.IsChecked -and -not $Exiting) { $AutoTimer.Start() }
     }
-    if ($problems) { [System.Windows.MessageBox]::Show(($problems -join "`n"), 'Some items could not be ended', 'OK', 'Warning') | Out-Null }
-    Start-Sleep -Milliseconds 400
-    return $true
 }
 
 function Restart-Elevated([string]$prefill) {
@@ -1038,6 +972,20 @@ function Check-Updates {
 
 function Show-Status([string]$t) { $ui.txtStatus.Text = $t; $ui.txtStatus.Dispatcher.Invoke([action]{}, 'Render') }
 
+# Errors are appended to %LOCALAPPDATA%\ProcessInspector\error.log so a problem can be diagnosed after the fact.
+$script:ErrorLog = Join-Path $IpcDir 'error.log'
+function Write-ErrorLog([string]$where, $err) {
+    try {
+        $ex = $err; $stack = ''
+        if ($err -is [System.Management.Automation.ErrorRecord]) { $ex = $err.Exception; $stack = $err.ScriptStackTrace }
+        $msg = if ($ex) { $ex.ToString() } else { [string]$err }
+        New-Item -ItemType Directory -Force -Path $IpcDir | Out-Null
+        Add-Content -Path $ErrorLog -Value "[$(Get-Date -Format s)] v$AppVersion $where`n$msg`n$stack`n" -Encoding UTF8
+        # keep the log small
+        if ((Get-Item $ErrorLog).Length -gt 512KB) { Get-Content $ErrorLog -Tail 400 | Set-Content $ErrorLog -Encoding UTF8 }
+    } catch {}
+}
+
 # ---- Processes tab ------------------------------------------------------------
 function Test-Unknown($o) {
     # "unknown" = nobody vouches for the program: unsigned or a bad signature. A process whose file we
@@ -1118,22 +1066,24 @@ function Update-Signers {
 $script:SigTimer = New-Object System.Windows.Threading.DispatcherTimer
 $SigTimer.Interval = [TimeSpan]::FromMilliseconds(300)
 $SigTimer.Add_Tick({
-    if (-not $SigJob) { $SigTimer.Stop(); return }
-    if (-not $SigJob.Handle.IsCompleted) { return }
-    $SigTimer.Stop()
     try {
-        $results = $SigJob.PS.EndInvoke($SigJob.Handle)
-        foreach ($x in $results) { $SignerCache[$x.Path] = $x.Signer }
-    } catch {} finally {
-        try { $SigJob.PS.Runspace.Dispose(); $SigJob.PS.Dispose() } catch {}
-        $script:SigJob = $null
-    }
-    if ($script:AllProcs) {
-        foreach ($r in $AllProcs) { if ($r.Path -and -not $r.Signer -and $SignerCache.ContainsKey($r.Path)) { $r.Signer = $SignerCache[$r.Path] } }
-        $ui.gridProcs.Items.Refresh()
-        Update-ProcCount
-        if ($ui.gridProcs.SelectedItem) { Show-Details $ui.gridProcs.SelectedItem }
-    }
+        if (-not $SigJob) { $SigTimer.Stop(); return }
+        if (-not $SigJob.Handle.IsCompleted) { return }
+        $SigTimer.Stop()
+        try {
+            $results = $SigJob.PS.EndInvoke($SigJob.Handle)
+            foreach ($x in $results) { if ($x.Path) { $SignerCache[$x.Path] = $x.Signer } }
+        } catch {} finally {
+            try { $SigJob.PS.Runspace.Dispose(); $SigJob.PS.Dispose() } catch {}
+            $script:SigJob = $null
+        }
+        if ($script:AllProcs -and -not $LoadingProcs) {
+            foreach ($r in $AllProcs) { if ($r.Path -and -not $r.Signer -and $SignerCache.ContainsKey($r.Path)) { $r.Signer = $SignerCache[$r.Path] } }
+            $ui.gridProcs.Items.Refresh()
+            Update-ProcCount
+            if ($ui.gridProcs.SelectedItem) { Show-Details $ui.gridProcs.SelectedItem }
+        }
+    } catch { Write-ErrorLog 'signatures' $_ }
 })
 
 $script:LoadingProcs = $false
@@ -1143,12 +1093,13 @@ function Load-Processes([switch]$Auto) {
     if (-not $Auto) { Show-Status 'Collecting processes...'; $window.Cursor = 'Wait' }
     try {
         # remember selection, sort and scroll position so a refresh does not throw them away
-        $selPid = $null; if ($ui.gridProcs.SelectedItem) { $selPid = $ui.gridProcs.SelectedItem.PID }
+        $selPids = @{}; foreach ($s in $ui.gridProcs.SelectedItems) { $selPids[[int]$s.PID] = $true }
+        $current = $ui.gridProcs.SelectedItem
         $sortCols = @($ui.gridProcs.Columns | Where-Object { $_.SortDirection -ne $null })
         $sv = Find-Child $ui.gridProcs ([System.Windows.Controls.ScrollViewer])
         $offset = if ($sv) { $sv.VerticalOffset } else { 0 }
 
-        $script:AllProcs = Get-ProcessRows
+        $script:AllProcs = Get-ProcessRows -KeepExited:($Auto -and $ui.chkAutoRefresh.IsChecked)
         $ui.gridProcs.ItemsSource = $AllProcs
         $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridProcs.ItemsSource)
         $view.Filter = $ProcFilter
@@ -1156,9 +1107,15 @@ function Load-Processes([switch]$Auto) {
             $view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription($c.SortMemberPath, $c.SortDirection)))
             $c.SortDirection = $c.SortDirection
         }
-        if ($null -ne $selPid) {
-            $again = $AllProcs | Where-Object { $_.PID -eq $selPid } | Select-Object -First 1
-            if ($again) { $ui.gridProcs.SelectedItem = $again; if (-not $Auto) { $ui.gridProcs.ScrollIntoView($again) } }
+        if ($selPids.Count -gt 0) {
+            $first = $null
+            foreach ($r in $AllProcs) {
+                if ($selPids.ContainsKey($r.PID)) {
+                    if ($selPids.Count -eq 1) { $ui.gridProcs.SelectedItem = $r } else { $ui.gridProcs.SelectedItems.Add($r) }
+                    if (-not $first -or ($current -and $r.PID -eq $current.PID)) { $first = $r }
+                }
+            }
+            if ($first -and -not $Auto) { $ui.gridProcs.ScrollIntoView($first) }
         }
         if ($sv -and $offset -gt 0) {
             $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Loaded,
@@ -1167,6 +1124,9 @@ function Load-Processes([switch]$Auto) {
         Update-ProcCount
         # signatures are checked after the list is on screen (one-time cost per new program)
         $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{ Update-Signers }) | Out-Null
+    } catch {
+        Write-ErrorLog 'refresh' $_
+        Show-Status "Could not refresh the list: $($_.Exception.Message)  (details in error.log)"
     } finally { $window.Cursor = $null; $script:LoadingProcs = $false }
 }
 function Update-ProcCount {
@@ -1220,7 +1180,9 @@ $script:Intervals = 2, 3, 5, 10
 $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
 $AutoTimer.Interval = [TimeSpan]::FromSeconds(3)
 $AutoTimer.Add_Tick({
-    if ($window.IsVisible -and $ui.tabs.SelectedIndex -eq 0 -and -not $LoadingProcs) { Load-Processes -Auto }
+    try {
+        if ($window.IsVisible -and $ui.tabs.SelectedIndex -eq 0 -and -not $LoadingProcs -and -not $CheckingLock) { Load-Processes -Auto }
+    } catch { Write-ErrorLog 'auto-refresh' $_ }
 })
 $ui.chkAutoRefresh.Add_Click({
     if ($ui.chkAutoRefresh.IsChecked) { $AutoTimer.Start() } else { $AutoTimer.Stop() }
@@ -1323,6 +1285,7 @@ function Update-Metrics {
     if ($r.PID -ne $SelProcPid) {
         $script:SelProcPid = $r.PID; $script:SelProcCpu = $null; $script:SelProcTime = $null
         $Hist.pcpu.Clear(); $Hist.pmem.Clear()
+        if ($SelProc) { try { $SelProc.Dispose() } catch {} }
         $script:SelProc = Get-Process -Id $r.PID -ErrorAction SilentlyContinue
     }
     if (-not $SelProc) { $ui.mProc.Text = "$($r.Name): no live data (access denied)"; return }
@@ -1348,7 +1311,7 @@ $script:MetricsTimer = New-Object System.Windows.Threading.DispatcherTimer
 $MetricsTimer.Interval = [TimeSpan]::FromSeconds(1)
 $MetricsTimer.Add_Tick({
     if ($window.IsVisible -and ($ui.metricsBar.Visibility -eq 'Visible' -or $ui.tabs.SelectedIndex -eq 0)) {
-        try { Update-Metrics } catch { $ui.mProc.Text = "metrics: $($_.Exception.Message)" }
+        try { Update-Metrics } catch { $ui.mProc.Text = "metrics: $($_.Exception.Message)"; Write-ErrorLog 'metrics' $_ }
     }
 })
 
@@ -2057,6 +2020,13 @@ $script:TrayTipShown = $false
 
 $app = New-Object System.Windows.Application
 $app.ShutdownMode = 'OnExplicitShutdown'
+# An exception that escapes an event handler would otherwise end the message loop and the app
+# with it, silently when hosted in the exe. Log it, tell the user, keep running.
+$app.Add_DispatcherUnhandledException({ param($s, $e)
+    Write-ErrorLog 'unhandled' $e.Exception
+    try { Show-Status "Error: $($e.Exception.Message)   (details in $ErrorLog)" } catch {}
+    $e.Handled = $true
+})
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Text = 'Process Inspector'
@@ -2089,15 +2059,17 @@ $script:ActivateEvent = New-Object System.Threading.EventWaitHandle($false, 'Aut
 $script:ipcTimer = New-Object System.Windows.Threading.DispatcherTimer
 $ipcTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $ipcTimer.Add_Tick({
-    if (-not $ActivateEvent.WaitOne(0)) { return }
-    $mode = 'show'; $p = ''
     try {
-        $lines = [IO.File]::ReadAllLines($IpcFile)
-        if ($lines.Count -ge 1) { $mode = $lines[0] }
-        if ($lines.Count -ge 2) { $p = $lines[1] }
-    } catch {}
-    if ($mode -ne 'silent') { Show-MainWindow }
-    if ($p) { $ui.txtPath.Text = $p; $ui.tabs.SelectedIndex = 2; Run-LockCheck }
+        if (-not $ActivateEvent.WaitOne(0)) { return }
+        $mode = 'show'; $p = ''
+        try {
+            $lines = [IO.File]::ReadAllLines($IpcFile)
+            if ($lines.Count -ge 1) { $mode = $lines[0] }
+            if ($lines.Count -ge 2) { $p = $lines[1] }
+        } catch {}
+        if ($mode -ne 'silent') { Show-MainWindow }
+        if ($p) { $ui.txtPath.Text = $p; $ui.tabs.SelectedIndex = 2; Run-LockCheck }
+    } catch { Write-ErrorLog 'activate' $_ }
 })
 $ipcTimer.Start()
 

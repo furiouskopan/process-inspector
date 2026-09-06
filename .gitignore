@@ -8,3 +8,6 @@ ProcessInspector.exe
 Thumbs.db
 desktop.ini
 *.log
+
+# build output
+*.dll

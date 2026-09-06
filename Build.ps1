@@ -95,6 +95,15 @@ if (-not $csc) { throw 'csc.exe (C# compiler from the .NET Framework) not found.
 $sma = Get-ChildItem "$env:WINDIR\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation" -Recurse -Filter 'System.Management.Automation.dll' | Select-Object -First 1
 if (-not $sma) { throw 'System.Management.Automation.dll not found in the GAC.' }
 
+# ---- 2b. Native helper DLL (row types, Restart Manager, handle enumeration, metrics) --------
+Write-Host "Compiling ProcessInspector.Native.dll..." -ForegroundColor Cyan
+Add-Type -AssemblyName PresentationCore, WindowsBase
+$nativeDll = Join-Path $root 'ProcessInspector.Native.dll'
+& $csc.FullName /nologo /target:library /platform:anycpu /optimize+ "/out:$nativeDll" `
+    "/r:$([System.Windows.Media.ImageSource].Assembly.Location)" "/r:$([System.Windows.DependencyObject].Assembly.Location)" `
+    (Join-Path $root 'Native.cs') (Join-Path $root 'HandleEnum.cs') (Join-Path $root 'SysMetrics.cs')
+if ($LASTEXITCODE -ne 0) { throw "csc failed for the native DLL ($LASTEXITCODE)" }
+
 # ---- 3. ProcessInspector.exe -------------------------------------------------------------
 Write-Host "Compiling ProcessInspector.exe..." -ForegroundColor Cyan
 $exe = Join-Path $root 'ProcessInspector.exe'
@@ -104,7 +113,7 @@ $manifest = Join-Path $root 'app.manifest'
 if ($LASTEXITCODE -ne 0) { throw "csc failed for Launcher.cs ($LASTEXITCODE)" }
 
 # ---- 4. Stage + portable zip --------------------------------------------------------------
-$files = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','SysMetrics.cs','app.ico',
+$files = 'ProcessInspector.exe','ProcessInspector.Native.dll','ProcessInspector.ps1','Native.cs','HandleEnum.cs','SysMetrics.cs','app.ico',
          'WhosLocking.ps1','ListProcesses.ps1','OpenFiles.ps1',
          'Install.ps1','Uninstall.ps1','README.md','LICENSE'
 Get-ChildItem $stage -File -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -129,7 +138,7 @@ if (-not $NoSetup) {
 }
 
 # ---- 6. Checksums + package manifests (scoop / winget) -----------------------------------
-$RepoOwner = 'furiouskopan'; $RepoName = 'process-inspector'; $Version = '1.2.0'
+$RepoOwner = 'furiouskopan'; $RepoName = 'process-inspector'; $Version = '1.2.1'
 $base = "https://github.com/$RepoOwner/$RepoName/releases/download/v$Version"
 $sums = @()
 foreach ($f in (Get-ChildItem $dist -File | Where-Object { $_.Extension -in '.zip', '.exe' })) {

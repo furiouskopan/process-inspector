@@ -132,6 +132,23 @@ After a release is published on GitHub:
 
 Requirements: Windows 10/11 with Windows PowerShell 5.1 (built in).
 
+## Troubleshooting
+
+- **The window disappeared.** When the app was started at sign-in (tray mode), closing the window only
+  hides it: it keeps running in the system tray. Left-click the tray icon to bring it back, right-click
+  it for *Exit*. *Restart as Administrator* also closes the current window and opens a new, elevated one
+  a few seconds later.
+- **A process would not end.** The reasons, in order of likelihood: it belongs to another user or runs
+  elevated (the app offers to restart as Administrator), it is a Windows service that refused to stop
+  (the app offers to force-end its host process), it is a protected or critical system process (refused
+  on purpose), or a parent process restarted it immediately (Chrome, antivirus). The app waits up to
+  three seconds and tells you if the process is still there.
+- **Something went wrong.** Errors are written to `%LOCALAPPDATA%\ProcessInspector\error.log`
+  together with a stack trace; the status bar shows the message. The app keeps running.
+- **Slow start.** The first launch after a Windows update rebuilds icon and signature caches; later
+  refreshes reuse them. The prebuilt `ProcessInspector.Native.dll` skips compiling the native helpers
+  at start; if it is missing the sources are compiled on the fly (a few seconds).
+
 ## Ideas for future versions
 
 - Rename / move on reboot (only delete is implemented)
