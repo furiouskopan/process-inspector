@@ -1,0 +1,10 @@
+# build output
+dist/
+ProcessInspector.exe
+*.zip
+*.pdb
+
+# local junk
+Thumbs.db
+desktop.ini
+*.log
