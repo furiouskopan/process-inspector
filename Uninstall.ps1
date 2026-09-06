@@ -20,8 +20,10 @@ Start-Sleep -Milliseconds 500
 Remove-Item (Join-Path ([Environment]::GetFolderPath('Desktop'))  "$AppName.lnk") -Force
 Remove-Item (Join-Path ([Environment]::GetFolderPath('Programs')) "$AppName.lnk") -Force
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'ProcessInspector'
-foreach ($k in 'HKCU:\Software\Classes\*\shell\WhosLocking','HKCU:\Software\Classes\Directory\shell\WhosLocking','HKCU:\Software\Classes\Drive\shell\WhosLocking') {
-    Remove-Item $k -Recurse -Force
+# .NET registry API: the "*" key name must not be treated as a wildcard
+$hkcu = [Microsoft.Win32.Registry]::CurrentUser
+foreach ($k in 'Software\Classes\*\shell\WhosLocking','Software\Classes\Directory\shell\WhosLocking','Software\Classes\Drive\shell\WhosLocking') {
+    try { $hkcu.DeleteSubKeyTree($k, $false) } catch {}
 }
 Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ProcessInspector' -Recurse -Force
 

@@ -68,15 +68,20 @@ function Install-App([hashtable]$o) {
     if ($o.Autostart) { New-Item -Path $run -Force | Out-Null; Set-ItemProperty -Path $run -Name 'ProcessInspector' -Value "`"$exe`" -Tray" }
     else { Remove-ItemProperty -Path $run -Name 'ProcessInspector' -ErrorAction SilentlyContinue }
 
-    # right-click menu
-    $keys = 'HKCU:\Software\Classes\*\shell\WhosLocking','HKCU:\Software\Classes\Directory\shell\WhosLocking','HKCU:\Software\Classes\Drive\shell\WhosLocking'
-    foreach ($k in $keys) {
+    # right-click menu. The "*" in the first key is a literal key name; PowerShell's registry
+    # provider would treat it as a wildcard (and scan every file type), so use .NET directly.
+    $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+    foreach ($k in 'Software\Classes\*\shell\WhosLocking','Software\Classes\Directory\shell\WhosLocking','Software\Classes\Drive\shell\WhosLocking') {
         if ($o.ContextMenu) {
-            New-Item -Path "$k\command" -Force | Out-Null
-            Set-ItemProperty -Path $k -Name '(default)' -Value "Who's locking this?"
-            Set-ItemProperty -Path $k -Name 'Icon' -Value "`"$icon`""
-            Set-ItemProperty -Path "$k\command" -Name '(default)' -Value "`"$exe`" -Path `"%1`""
-        } elseif (Test-Path $k) { Remove-Item $k -Recurse -Force }
+            $key = $hkcu.CreateSubKey($k)
+            $key.SetValue('', "Who's locking this?")
+            $key.SetValue('Icon', "`"$icon`"")
+            $cmd = $key.CreateSubKey('command')
+            $cmd.SetValue('', "`"$exe`" -Path `"%1`"")
+            $cmd.Close(); $key.Close()
+        } else {
+            $hkcu.DeleteSubKeyTree($k, $false)
+        }
     }
 
     # Settings > Apps entry
