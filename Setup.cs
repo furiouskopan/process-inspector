@@ -10,8 +10,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Process Inspector Setup")]
 [assembly: AssemblyProduct("Process Inspector")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 static class Setup
 {

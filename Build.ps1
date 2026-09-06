@@ -104,9 +104,8 @@ $manifest = Join-Path $root 'app.manifest'
 if ($LASTEXITCODE -ne 0) { throw "csc failed for Launcher.cs ($LASTEXITCODE)" }
 
 # ---- 4. Stage + portable zip --------------------------------------------------------------
-$files = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','app.ico',
+$files = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','SysMetrics.cs','app.ico',
          'WhosLocking.ps1','ListProcesses.ps1','OpenFiles.ps1',
-         'ProcessInspector.cmd','WhosLocking.cmd','ListProcesses.cmd',
          'Install.ps1','Uninstall.ps1','README.md','LICENSE'
 Get-ChildItem $stage -File -ErrorAction SilentlyContinue | Remove-Item -Force
 foreach ($f in $files) {
@@ -130,7 +129,7 @@ if (-not $NoSetup) {
 }
 
 # ---- 6. Checksums + package manifests (scoop / winget) -----------------------------------
-$RepoOwner = 'furiouskopan'; $RepoName = 'process-inspector'; $Version = '1.1.0'
+$RepoOwner = 'furiouskopan'; $RepoName = 'process-inspector'; $Version = '1.2.0'
 $base = "https://github.com/$RepoOwner/$RepoName/releases/download/v$Version"
 $sums = @()
 foreach ($f in (Get-ChildItem $dist -File | Where-Object { $_.Extension -in '.zip', '.exe' })) {

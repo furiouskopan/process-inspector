@@ -39,8 +39,17 @@ that talks to the Windows Restart Manager and the kernel handle table, wrapped i
   on the machine is searched for it.
 - **Network tab** – TCP connections and UDP listeners per process, searchable by process, address,
   port or state.
-- **Live view** – optional 3-second auto-refresh with a CPU % column; new processes are highlighted
-  green and exited ones red for one cycle. Selection, sort order and scroll position survive refreshes.
+- **Live metrics** – a strip with CPU, memory, disk and network sparklines sampled every second
+  through native calls (no performance counters, so it works on any Windows language), and a live
+  CPU / memory chart for the selected process. Can be hidden.
+- **Live view** – optional auto-refresh (2 to 10 s) with CPU %, Disk KB/s, Threads and Handles
+  columns; new processes are highlighted green and exited ones red for one cycle. Selection, sort
+  order and scroll position survive refreshes. Per-path data (descriptions, icons, signers) and
+  per-process users are cached, so a refresh costs a fraction of the first load.
+- **Process icons**, search placeholders, a column chooser, row tooltips with the full command line,
+  `Esc` to clear a search box.
+- **Unknowns made visible** – a user, path or signer that cannot be read shows as *(unknown)* instead
+  of a blank, and *Only unsigned / unknown* filters the list down to processes nobody vouches for.
 - **Signer column** – Authenticode signer of every process (or *Unsigned*), plus one-click
   *Check file on VirusTotal* (SHA-256 is computed locally and copied to the clipboard).
 - **Right-click menus** on every list: end process, end process tree, restart process, stop or restart
@@ -113,6 +122,7 @@ After a release is published on GitHub:
 
 | Piece | Mechanism |
 |---|---|
+| Live metrics | `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetProcessIoCounters` (or the PhysicalDisk counter when available), `NetworkInterface` statistics |
 | Who's locking | `rstrtmgr.dll` (Restart Manager): `RmRegisterResources` + `RmGetList` |
 | Open files | `NtQuerySystemInformation(SystemExtendedHandleInformation)` → `DuplicateHandle` → `GetFileType` (skips pipes, so no hangs) → `GetFinalPathNameByHandle` |
 | Process owner | `OpenProcessToken` + `WindowsIdentity` (fast, unlike WMI `GetOwner`) |
@@ -125,7 +135,7 @@ Requirements: Windows 10/11 with Windows PowerShell 5.1 (built in).
 ## Ideas for future versions
 
 - Rename / move on reboot (only delete is implemented)
-- Per-process disk and network I/O rates
+- Per-process network I/O rates (disk rate is there; network needs ETW)
 - Per-monitor DPI (the app is system-DPI aware today)
 - Chocolatey package
 - Rewrite the UI in C#/WPF (or WinUI 3) once the feature set settles, keeping the scripts as the engine

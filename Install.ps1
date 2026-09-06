@@ -27,12 +27,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $AppName = 'Process Inspector'
-$Version = '1.1.0'
+$Version = '1.2.0'
 $Dest    = Join-Path $env:LOCALAPPDATA 'Programs\ProcessInspector'
-$Files   = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','app.ico',
+$Files   = 'ProcessInspector.exe','ProcessInspector.ps1','HandleEnum.cs','SysMetrics.cs','app.ico',
            'WhosLocking.ps1','ListProcesses.ps1','OpenFiles.ps1',
-           'ProcessInspector.cmd','WhosLocking.cmd','ListProcesses.cmd',
            'Install.ps1','Uninstall.ps1','README.md','LICENSE'
+$Stale   = 'ProcessInspector.cmd','WhosLocking.cmd','ListProcesses.cmd','Install-ContextMenu.ps1'   # from older versions
 
 function Install-App([hashtable]$o) {
     # stop a running copy so the exe can be replaced
@@ -44,6 +44,7 @@ function Install-App([hashtable]$o) {
         $src = Join-Path $Source $f
         if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $Dest $f) -Force }
     }
+    foreach ($f in $Stale) { Remove-Item -LiteralPath (Join-Path $Dest $f) -Force -ErrorAction SilentlyContinue }
     $exe  = Join-Path $Dest 'ProcessInspector.exe'
     $icon = Join-Path $Dest 'app.ico'
     if (-not (Test-Path $exe)) { throw "ProcessInspector.exe is missing from $Source. Run Build.ps1 first." }
