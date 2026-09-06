@@ -98,7 +98,8 @@ if (-not $sma) { throw 'System.Management.Automation.dll not found in the GAC.' 
 # ---- 3. ProcessInspector.exe -------------------------------------------------------------
 Write-Host "Compiling ProcessInspector.exe..." -ForegroundColor Cyan
 $exe = Join-Path $root 'ProcessInspector.exe'
-& $csc.FullName /nologo /target:winexe /platform:anycpu /optimize+ "/win32icon:$ico" `
+$manifest = Join-Path $root 'app.manifest'
+& $csc.FullName /nologo /target:winexe /platform:anycpu /optimize+ "/win32icon:$ico" "/win32manifest:$manifest" `
     "/r:$($sma.FullName)" /r:System.Windows.Forms.dll "/out:$exe" (Join-Path $root 'Launcher.cs')
 if ($LASTEXITCODE -ne 0) { throw "csc failed for Launcher.cs ($LASTEXITCODE)" }
 
@@ -122,7 +123,7 @@ if (-not $NoSetup) {
     Write-Host "Compiling ProcessInspector-Setup.exe..." -ForegroundColor Cyan
     $setup = Join-Path $dist 'ProcessInspector-Setup.exe'
     $res = Get-ChildItem $stage -File | ForEach-Object { "/resource:$($_.FullName),$($_.Name)" }
-    & $csc.FullName /nologo /target:winexe /platform:anycpu /optimize+ "/win32icon:$ico" `
+    & $csc.FullName /nologo /target:winexe /platform:anycpu /optimize+ "/win32icon:$ico" "/win32manifest:$manifest" `
         /r:System.Windows.Forms.dll "/out:$setup" @res (Join-Path $root 'Setup.cs')
     if ($LASTEXITCODE -ne 0) { throw "csc failed for Setup.cs ($LASTEXITCODE)" }
     Write-Host "Installer: $setup" -ForegroundColor Green

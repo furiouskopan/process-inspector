@@ -1,14 +1,17 @@
 <#
 .SYNOPSIS
-  Process Inspector - a window with two tabs:
+  Process Inspector - a window with three tabs:
     1. Processes        : every running process, who it runs as, what started it,
-                          which services it hosts. Live search, sort, end process.
-    2. Who's locking?   : pick / drop a file or folder and see which processes hold
+                          which services it hosts, which files it has open.
+    2. Open files       : every file every process has open, searchable.
+    3. Who's locking?   : pick / drop a file or folder and see which processes hold
                           it open. End the process or stop the service from there.
+  Only one copy runs at a time; starting it again brings the running window to the front.
 
 .EXAMPLE
   .\ProcessInspector.ps1
   .\ProcessInspector.ps1 -Path "C:\some\locked\file.mdf"     # opens on the lock tab
+  .\ProcessInspector.ps1 -Tray                                # start hidden in the tray
 #>
 [CmdletBinding()]
 param(
@@ -28,6 +31,28 @@ $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Wind
 $script:AppRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:ExePath = $env:PROCESS_INSPECTOR_EXE          # set by ProcessInspector.exe when hosting this script
 $script:AppVersion = '1.0.0'
+
+# ---- Single instance: if a copy is already running, hand it our request and quit ----
+$script:IpcSuffix = if ($IsAdmin) { '.admin' } else { '' }
+$script:IpcDir    = Join-Path $env:LOCALAPPDATA 'ProcessInspector'
+$script:IpcFile   = Join-Path $IpcDir 'activate.txt'
+$script:Mutex     = $null
+if (-not $SelfTest) {
+    $created = $false
+    $script:Mutex = New-Object System.Threading.Mutex($true, "Local\ProcessInspector.Instance$IpcSuffix", [ref]$created)
+    if (-not $created) {
+        try {
+            New-Item -ItemType Directory -Force -Path $IpcDir | Out-Null
+            $mode = if ($Tray -and -not $Show -and -not $Path) { 'silent' } else { 'show' }
+            [IO.File]::WriteAllLines($IpcFile, [string[]]@($mode, [string]$Path))
+            $evt = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', "Local\ProcessInspector.Activate$IpcSuffix")
+            $evt.Set() | Out-Null
+            $evt.Dispose()
+        } catch {}
+        $global:ProcessInspectorExited = $true
+        return
+    }
+}
 
 # =============================================================================
 # Native helpers + row types
@@ -66,6 +91,7 @@ public class LockRow {
     public string   User         { get; set; }
     public DateTime? Started     { get; set; }
     public string   Path         { get; set; }
+    public string   HeldItem     { get; set; }
 }
 
 public static class ProcUser {
@@ -202,40 +228,101 @@ function Get-FilesUnder([string]$p) {
 
 $typeNames = @{ 0='Unknown'; 1='App'; 2='App (no window)'; 3='Service'; 4='Explorer'; 5='Console'; 1000='Critical' }
 
+# A lock-tab row for a PID, filled from the process list when we have it.
+function New-LockRow([int]$pid_) {
+    $proc = Get-Process -Id $pid_ -ErrorAction SilentlyContinue
+    $r = New-Object WhosLocking.LockRow
+    $r.PID  = $pid_
+    $r.Name = if ($proc) { $proc.ProcessName } else { '(exited)' }
+    $known = $null
+    if ($script:AllProcs) { $known = $AllProcs | Where-Object { $_.PID -eq $pid_ } | Select-Object -First 1 }
+    if ($known) {
+        $r.Description = $known.Description
+        $r.ServiceNames = $known.ServiceNames
+        if ($known.ServiceNames) { $r.Type = "Service ($($known.ServiceNames))" }
+        $r.Path = $known.Path
+        if ($known.Started) { $r.Started = $known.Started }
+    } elseif ($proc) {
+        try { $r.Description = $proc.MainModule.FileVersionInfo.FileDescription } catch {}
+    }
+    $r.User = [WhosLocking.ProcUser]::Get($pid_)
+    if ($proc) {
+        if (-not $r.Path)    { try { $r.Path = $proc.Path } catch {} }
+        if (-not $r.Started) { try { $r.Started = $proc.StartTime } catch {} }
+    }
+    return $r
+}
+
+# Restart Manager: processes that have these files open or loaded as EXE/DLL.
 function Find-LockRows([string[]]$files) {
+    $list = New-Object 'System.Collections.Generic.List[WhosLocking.LockRow]'
+    $files = @($files)
+    if ($files.Count -eq 0) { return ,$list }
     $lockers = @{}
     $batch = 500
     for ($i = 0; $i -lt $files.Count; $i += $batch) {
         $end = [Math]::Min($i + $batch, $files.Count) - 1
+        if ($files.Count -gt $batch) { Show-Status "Checking files $($i + 1)-$($end + 1) of $($files.Count)..." }
         foreach ($l in [WhosLocking.RestartManager]::Find([string[]]$files[$i..$end])) {
             if (-not $lockers.ContainsKey($l.Pid)) { $lockers[$l.Pid] = $l }
         }
     }
-    $list = New-Object 'System.Collections.Generic.List[WhosLocking.LockRow]'
     foreach ($l in $lockers.Values) {
-        $proc = Get-Process -Id $l.Pid -ErrorAction SilentlyContinue
-        $r = New-Object WhosLocking.LockRow
-        $r.PID = $l.Pid
-        $r.Name = if ($proc) { $proc.ProcessName } else { '(exited)' }
-        $r.Description = $l.AppName
-        $r.ServiceNames = $l.ServiceName
-        $r.Type = if ($l.ServiceName) { "Service ($($l.ServiceName))" } else { $typeNames[$l.AppType] }
-        $r.User = [WhosLocking.ProcUser]::Get($l.Pid)
-        if ($proc) {
-            try { $r.Path = $proc.Path } catch {}
-            try { $r.Started = $proc.StartTime } catch {}
-        }
+        $r = New-LockRow $l.Pid
+        if ($l.AppName)     { $r.Description = $l.AppName }
+        if ($l.ServiceName) { $r.ServiceNames = $l.ServiceName }
+        $r.Type = if ($r.ServiceNames) { "Service ($($r.ServiceNames))" } else { $typeNames[$l.AppType] }
+        if ($files.Count -eq 1) { $r.HeldItem = $files[0] }
         $list.Add($r)
     }
     return ,$list
+}
+
+# Handle scan: processes holding anything under a folder open (including the folder itself,
+# which is what a console window's "current directory" looks like). Merges into $rows.
+function Merge-HandleLocks($rows, [string]$folder) {
+    $base   = $folder.TrimEnd('\')
+    $prefix = $base + '\'
+    $held = @{}
+    foreach ($f in [WhosLocking.HandleEnum]::GetFiles(-1)) {
+        if ($f.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($f.Path, $base, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $held.ContainsKey($f.Pid)) { $held[$f.Pid] = New-Object System.Collections.Generic.List[string] }
+            $held[$f.Pid].Add($f.Path)
+        }
+    }
+    $byPid = @{}
+    foreach ($r in $rows) { $byPid[$r.PID] = $r }
+    foreach ($k in $held.Keys) {
+        $items = $held[$k]
+        $label = if ($items.Count -eq 1) { $items[0] } else { "$($items[0])  (+$($items.Count - 1) more)" }
+        if ($byPid.ContainsKey($k)) {
+            if (-not $byPid[$k].HeldItem) { $byPid[$k].HeldItem = $label }
+        } else {
+            $r = New-LockRow $k
+            if (-not $r.Type) {
+                $r.Type = if ($items -contains $base) { 'Folder handle / working directory' } else { 'Open file handle' }
+            }
+            $r.HeldItem = $label
+            $rows.Add($r)
+        }
+    }
+    return ,$rows
 }
 
 # Files a process (or every process when $pid_ = -1) currently has open.
 function Get-OpenFileRows([int]$pid_, [bool]$includeModules, [hashtable]$names) {
     $list = New-Object 'System.Collections.Generic.List[WhosLocking.FileRow]'
     foreach ($f in [WhosLocking.HandleEnum]::GetFiles($pid_)) {
+        $name = $names[[int]$f.Pid]
+        if (-not $name) {
+            # started after the process list was loaded
+            $gp = Get-Process -Id $f.Pid -ErrorAction SilentlyContinue
+            $name = if ($gp) { $gp.ProcessName + '.exe' } else { "(pid $($f.Pid))" }
+            $names[[int]$f.Pid] = $name
+        }
         $r = New-Object WhosLocking.FileRow
-        $r.PID = $f.Pid; $r.Process = $names[[int]$f.Pid]; $r.Kind = 'Open file'; $r.File = $f.Path
+        $r.PID = $f.Pid; $r.Process = $name; $r.Kind = 'Open file'; $r.File = $f.Path
         $list.Add($r)
     }
     if ($includeModules) {
@@ -367,8 +454,9 @@ $xaml = @'
         <Grid Margin="8">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="*" MinHeight="120"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="230" MinHeight="90"/>
           </Grid.RowDefinitions>
 
           <DockPanel Grid.Row="0" Margin="0,0,0,8">
@@ -393,7 +481,9 @@ $xaml = @'
             </DataGrid.Columns>
           </DataGrid>
 
-          <Grid Grid.Row="2" Margin="0,8,0,0" Height="230">
+          <GridSplitter Grid.Row="2" Height="8" HorizontalAlignment="Stretch" Background="Transparent"
+                        ResizeDirection="Rows" ResizeBehavior="PreviousAndNext" Cursor="SizeNS"/>
+          <Grid Grid.Row="3">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="2*"/>
               <ColumnDefinition Width="3*"/>
@@ -476,6 +566,7 @@ $xaml = @'
               <DataGridTextColumn Header="Type"        Binding="{Binding Type}"        Width="180"/>
               <DataGridTextColumn Header="User"        Binding="{Binding User}"        Width="150"/>
               <DataGridTextColumn Header="Started"     Binding="{Binding Started, StringFormat=g}" Width="130"/>
+              <DataGridTextColumn Header="Held item"   Binding="{Binding HeldItem}"    Width="260"/>
               <DataGridTextColumn Header="Path"        Binding="{Binding Path}"        Width="*"/>
             </DataGrid.Columns>
           </DataGrid>
@@ -509,6 +600,15 @@ $script:IconPath = Join-Path $AppRoot 'app.ico'
 if (Test-Path $IconPath) {
     try { $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([uri]$IconPath) } catch {}
 }
+# never open larger than the screen
+$wa = [System.Windows.SystemParameters]::WorkArea
+if ($window.Width  -gt $wa.Width  - 40) { $window.Width  = [Math]::Max($window.MinWidth,  $wa.Width  - 40) }
+if ($window.Height -gt $wa.Height - 40) { $window.Height = [Math]::Max($window.MinHeight, $wa.Height - 40) }
+
+function Test-Match([string]$text, [string]$q) {
+    # plain substring match, case-insensitive, no wildcard surprises with [ ] * ?
+    return ($null -ne $text -and $text.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
 
 function Show-Status([string]$t) { $ui.txtStatus.Text = $t; $ui.txtStatus.Dispatcher.Invoke([action]{}, 'Render') }
 
@@ -518,21 +618,36 @@ $script:ProcFilter = [Predicate[object]]{
     $q = $ui.txtSearch.Text
     if ([string]::IsNullOrWhiteSpace($q)) { return $true }
     $q = $q.Trim()
-    return ($o.Name -like "*$q*" -or $o.Description -like "*$q*" -or $o.Services -like "*$q*" -or
-            $o.Path -like "*$q*" -or $o.User -like "*$q*" -or $o.Parent -like "*$q*" -or
-            [string]$o.PID -eq $q -or $o.CommandLine -like "*$q*")
+    return ((Test-Match $o.Name $q) -or (Test-Match $o.Description $q) -or (Test-Match $o.Services $q) -or
+            (Test-Match $o.Path $q) -or (Test-Match $o.User $q) -or (Test-Match $o.Parent $q) -or
+            [string]$o.PID -eq $q -or (Test-Match $o.CommandLine $q))
 }
 
+$script:LoadingProcs = $false
 function Load-Processes {
+    if ($LoadingProcs) { return }          # a click during the wait cursor must not re-enter
+    $script:LoadingProcs = $true
     Show-Status 'Collecting processes...'
     $window.Cursor = 'Wait'
     try {
+        # remember selection + sort so a refresh does not throw them away
+        $selPid = $null; if ($ui.gridProcs.SelectedItem) { $selPid = $ui.gridProcs.SelectedItem.PID }
+        $sortCols = @($ui.gridProcs.Columns | Where-Object { $_.SortDirection -ne $null })
+
         $script:AllProcs = Get-ProcessRows
         $ui.gridProcs.ItemsSource = $AllProcs
         $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridProcs.ItemsSource)
         $view.Filter = $ProcFilter
+        foreach ($c in $sortCols) {
+            $view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription($c.SortMemberPath, $c.SortDirection)))
+            $c.SortDirection = $c.SortDirection
+        }
+        if ($null -ne $selPid) {
+            $again = $AllProcs | Where-Object { $_.PID -eq $selPid } | Select-Object -First 1
+            if ($again) { $ui.gridProcs.SelectedItem = $again; $ui.gridProcs.ScrollIntoView($again) }
+        }
         Update-ProcCount
-    } finally { $window.Cursor = $null }
+    } finally { $window.Cursor = $null; $script:LoadingProcs = $false }
 }
 function Update-ProcCount {
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridProcs.ItemsSource)
@@ -563,8 +678,12 @@ $ui.gridProcs.Add_SelectionChanged({
         "Command:     $($r.CommandLine)"
     )
     $ui.txtDetails.Text = $lines -join "`n"
-    Load-SelectedFiles
+    # debounce: arrow-keying through the list must not scan handles on every step
+    $FilesTimer.Stop(); $FilesTimer.Start()
 })
+$script:FilesTimer = New-Object System.Windows.Threading.DispatcherTimer
+$FilesTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$FilesTimer.Add_Tick({ $FilesTimer.Stop(); Load-SelectedFiles })
 
 function Get-NameMap {
     $m = @{}
@@ -599,17 +718,36 @@ $ui.btnOpenLoc.Add_Click({
 })
 
 # ---- Lock tab -------------------------------------------------------------------
+# Extensions Restart Manager is worth asking about inside a folder (loaded images). Everything
+# else in a folder is covered faster and better by the handle scan.
+$script:ImageExt = '.exe','.dll','.sys','.ocx','.drv','.cpl','.scr','.mui','.node','.pyd','.ax'
+
+$script:CheckingLock = $false
 function Run-LockCheck {
+    if ($CheckingLock) { return }
     $p = $ui.txtPath.Text.Trim().Trim('"')
     if (-not $p) { Show-Status 'Enter or drop a path first.'; return }
+    $script:CheckingLock = $true
     $window.Cursor = 'Wait'
     try {
-        Show-Status 'Collecting files...'
-        $files = Get-FilesUnder $p
-        if ($files.Count -eq 0) { $ui.gridLock.ItemsSource = $null; $ui.txtLockInfo.Text = 'Folder is empty.'; Show-Status 'Ready'; return }
-        Show-Status "Checking $($files.Count) file(s)..."
+        if (-not (Test-Path -LiteralPath $p)) { throw "Not found: $p" }
+        $item  = Get-Item -LiteralPath $p -Force
+        $isDir = $item.PSIsContainer
         try {
-            $rows = Find-LockRows $files
+            if ($isDir) {
+                Show-Status 'Collecting files...'
+                $files   = Get-FilesUnder $item.FullName
+                $rmFiles = @($files | Where-Object { $ImageExt -contains [IO.Path]::GetExtension($_).ToLowerInvariant() })
+                Show-Status "Checking $($rmFiles.Count) program file(s)..."
+                $rows = Find-LockRows $rmFiles
+                Show-Status 'Scanning open handles under the folder...'
+                $rows = Merge-HandleLocks $rows $item.FullName
+                $what = "folder ($($files.Count) files)"
+            } else {
+                Show-Status 'Checking...'
+                $rows = Find-LockRows @($item.FullName)
+                $what = 'file'
+            }
         } catch {
             $m = $_.Exception.Message
             if ($_.Exception.InnerException) { $m = $_.Exception.InnerException.Message }
@@ -625,15 +763,16 @@ function Run-LockCheck {
         }
         $ui.gridLock.ItemsSource = $rows
         if ($rows.Count -eq 0) {
-            $ui.txtLockInfo.Text = 'No process is holding it open' + $(if (-not $IsAdmin) { ' (as far as a non-admin can see).' } else { '.' })
+            $ui.txtLockInfo.Text = 'No process is holding it open' + $(if (-not $IsAdmin) { ' (as far as a non-admin can see - services and other users are hidden).' } else { '.' })
         } else {
             $ui.txtLockInfo.Text = "Held open by $($rows.Count) process(es). Select one and click 'End process / stop service' to release it."
         }
-        Show-Status "Checked $($files.Count) file(s)."
+        Show-Status "Checked $what."
     } catch {
+        $ui.gridLock.ItemsSource = $null
         $ui.txtLockInfo.Text = "Error: $($_.Exception.Message)"
         Show-Status 'Error'
-    } finally { $window.Cursor = $null }
+    } finally { $window.Cursor = $null; $script:CheckingLock = $false }
 }
 
 $ui.btnCheck.Add_Click({ Run-LockCheck })
@@ -671,24 +810,29 @@ $script:FileFilter = [Predicate[object]]{
     $q = $ui.txtFileSearch.Text
     if ([string]::IsNullOrWhiteSpace($q)) { return $true }
     $q = $q.Trim()
-    return ($o.File -like "*$q*" -or $o.Process -like "*$q*" -or [string]$o.PID -eq $q)
+    return ((Test-Match $o.File $q) -or (Test-Match $o.Process $q) -or [string]$o.PID -eq $q)
 }
+$script:AllFilesTotal = 0; $script:AllFilesProcs = 0
 function Update-FileCount {
     if (-not $ui.gridAllFiles.ItemsSource) { return }
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridAllFiles.ItemsSource)
     $shown = 0; foreach ($x in $view) { $shown++ }
-    $total = $ui.gridAllFiles.ItemsSource.Count
-    $procs = @($ui.gridAllFiles.ItemsSource | Select-Object -ExpandProperty PID -Unique).Count
-    $msg = "$shown of $total file(s) across $procs process(es)."
+    $msg = "$shown of $AllFilesTotal file(s) across $AllFilesProcs process(es)."
     if (-not $IsAdmin) { $msg += '  Not elevated: files held by services / other users are not visible.' }
     $ui.txtAllFilesInfo.Text = $msg
 }
+$script:LoadingFiles = $false
 function Load-AllFiles {
+    if ($LoadingFiles) { return }
+    $script:LoadingFiles = $true
     if (-not $script:AllProcs) { Load-Processes }
     Show-Status 'Scanning open handles of every process...'
     $window.Cursor = 'Wait'
     try {
         $rows = Get-OpenFileRows -1 ([bool]$ui.chkAllModules.IsChecked) (Get-NameMap)
+        $script:AllFilesTotal = $rows.Count
+        $pids = @{}; foreach ($r in $rows) { $pids[$r.PID] = $true }
+        $script:AllFilesProcs = $pids.Count
         $ui.gridAllFiles.ItemsSource = $rows
         $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridAllFiles.ItemsSource)
         $view.Filter = $FileFilter
@@ -697,7 +841,7 @@ function Load-AllFiles {
     } catch {
         $ui.txtAllFilesInfo.Text = "Error: $($_.Exception.Message)"
         Show-Status 'Error'
-    } finally { $window.Cursor = $null }
+    } finally { $window.Cursor = $null; $script:LoadingFiles = $false }
 }
 $ui.btnLoadAllFiles.Add_Click({ Load-AllFiles })
 $ui.txtFileSearch.Add_TextChanged({
@@ -894,6 +1038,7 @@ if ($SelfTest) {
     if ($Path) { Run-LockCheck; Write-Host "SelfTest lock: $($ui.txtLockInfo.Text)"; $ui.gridLock.ItemsSource | Format-Table PID, Name, Type, User, Path -AutoSize | Out-String | Write-Host }
     Write-Host "SelfTest status: $($ui.txtStatus.Text)"
     $ui.gridProcs.SelectedIndex = 0
+    $FilesTimer.Stop(); Load-SelectedFiles
     Write-Host "SelfTest selected-files: $($ui.txtFilesHeader.Text)"
     Load-AllFiles
     Write-Host "SelfTest all-files: $($ui.txtAllFilesInfo.Text)"
@@ -950,10 +1095,29 @@ function Exit-App {
     if ($window.IsVisible -or $window.IsLoaded) { $window.Close() } else { Stop-App }
 }
 function Stop-App {
+    try { $ipcTimer.Stop(); $ActivateEvent.Dispose() } catch {}
     try { $notify.Visible = $false; $notify.Dispose() } catch {}
+    try { $Mutex.ReleaseMutex(); $Mutex.Dispose() } catch {}
     $global:ProcessInspectorExited = $true       # tells ProcessInspector.exe this was a clean exit
     $app.Shutdown()
 }
+
+# Requests from a second copy of the app (see the single-instance block at the top).
+$script:ActivateEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', "Local\ProcessInspector.Activate$IpcSuffix")
+$script:ipcTimer = New-Object System.Windows.Threading.DispatcherTimer
+$ipcTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$ipcTimer.Add_Tick({
+    if (-not $ActivateEvent.WaitOne(0)) { return }
+    $mode = 'show'; $p = ''
+    try {
+        $lines = [IO.File]::ReadAllLines($IpcFile)
+        if ($lines.Count -ge 1) { $mode = $lines[0] }
+        if ($lines.Count -ge 2) { $p = $lines[1] }
+    } catch {}
+    if ($mode -ne 'silent') { Show-MainWindow }
+    if ($p) { $ui.txtPath.Text = $p; $ui.tabs.SelectedIndex = 2; Run-LockCheck }
+})
+$ipcTimer.Start()
 
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $null = $trayMenu.Items.Add('Open Process Inspector', $null, { Show-MainWindow })
