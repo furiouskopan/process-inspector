@@ -13,6 +13,10 @@ that talks to the Windows Restart Manager and the kernel handle table, wrapped i
 |---|---|---|
 | ![Processes tab](docs/processes.png) | ![Open files tab](docs/open-files.png) | ![Who's locking tab](docs/whos-locking.png) |
 
+| Dark theme | Network |
+|---|---|
+| ![Dark theme](docs/dark-processes.png) | ![Network tab](docs/network.png) |
+
 ## Features
 
 - **Processes tab** – every process with description, user account, memory, start time and a
@@ -28,9 +32,23 @@ that talks to the Windows Restart Manager and the kernel handle table, wrapped i
   End the process or stop the service right there.
 - **Single instance** – starting it again (Desktop shortcut, right-click menu, command line)
   brings the running window to the front and hands over the path instead of opening a second copy.
-- **Right-click menus** on every list: end process, end process tree, stop hosted service, show files
-  used, go to parent, open file location, search online, copy PID/name/path/command line, properties.
+- **Release a file without killing anything** – close the one handle inside the other program
+  (`DuplicateHandle` + `DUPLICATE_CLOSE_SOURCE`, the Unlocker trick). Available on the lock tab and on
+  every file list. Or schedule a stuck file for **deletion at the next reboot**.
+- **Partial-name search** – type part of a name instead of a path on the lock tab and every open handle
+  on the machine is searched for it.
+- **Network tab** – TCP connections and UDP listeners per process, searchable by process, address,
+  port or state.
+- **Live view** – optional 3-second auto-refresh with a CPU % column; new processes are highlighted
+  green and exited ones red for one cycle. Selection, sort order and scroll position survive refreshes.
+- **Signer column** – Authenticode signer of every process (or *Unsigned*), plus one-click
+  *Check file on VirusTotal* (SHA-256 is computed locally and copied to the clipboard).
+- **Right-click menus** on every list: end process, end process tree, restart process, stop or restart
+  hosted service, run as different user, show files / network connections, go to parent, open file
+  location, search online, copy PID/name/path/command line, copy as table, export to CSV, properties.
   `Del` ends, `F5` refreshes, `Ctrl+F` focuses search, `Ctrl+C` copies rows.
+- **Dark theme**, remembered together with the window size and the auto-refresh setting.
+- **Check for updates** against this repository's GitHub Releases (on demand only, nothing phones home).
 - **Administrator aware** – files held by services (SQL Server, antivirus, Windows services) are
   invisible to a normal user. The app detects the access-denied case and offers to restart elevated.
 - **System tray** – optional autostart at logon, minimised to the tray. Left-click opens the window,
@@ -78,8 +96,18 @@ Nothing to install: the build uses `csc.exe` from the .NET Framework that is par
 .\Build.ps1
 ```
 
-produces `app.ico`, `ProcessInspector.exe`, `dist\ProcessInspector-portable.zip` and
-`dist\ProcessInspector-Setup.exe`.
+produces `app.ico`, `ProcessInspector.exe`, `dist\ProcessInspector-portable.zip`,
+`dist\ProcessInspector-Setup.exe`, `dist\SHA256SUMS.txt` and refreshed package manifests in
+`packaging\` (a Scoop manifest and a winget singleton manifest with the release URLs and hashes filled in).
+
+### Package managers
+
+After a release is published on GitHub:
+
+- **Scoop**: `scoop install https://raw.githubusercontent.com/furiouskopan/process-inspector/main/packaging/scoop/process-inspector.json`
+- **winget**: submit `packaging\winget\furiouskopan.ProcessInspector.yaml` to
+  [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) (or `winget install --manifest packaging\winget`
+  locally with the setting `LocalManifestFiles` enabled).
 
 ## How it works
 
@@ -96,21 +124,14 @@ Requirements: Windows 10/11 with Windows PowerShell 5.1 (built in).
 
 ## Ideas for future versions
 
-- Search handles for a **partial name** ("who has anything under D:\Projects open?")
-- **Unlock without killing**: close the single handle in the other process (`DuplicateHandle` with
-  `DUPLICATE_CLOSE_SOURCE`), the way Unlocker / Process Explorer do
-- **Delete / rename / move on reboot** for files that cannot be released now (`MoveFileEx` with
-  `MOVEFILE_DELAY_UNTIL_REBOOT`)
-- **Network connections** per process (TCP/UDP endpoints, like TCPView)
-- **Live CPU / memory** columns with auto-refresh and process highlighting (new = green, exiting = red)
-- **Loaded DLL search**: which processes have a given DLL loaded
-- **Signature / publisher check** and VirusTotal hash lookup for unknown processes
-- **Restart process** and **run as another user**
-- **Export** the current view to CSV / clipboard as a table
-- **Dark theme** and per-monitor DPI polish
-- **Auto-update** check against GitHub Releases
-- **Winget / Scoop / Chocolatey** packages
+- Rename / move on reboot (only delete is implemented)
+- Per-process disk and network I/O rates
+- Per-monitor DPI (the app is system-DPI aware today)
+- Chocolatey package
 - Rewrite the UI in C#/WPF (or WinUI 3) once the feature set settles, keeping the scripts as the engine
+
+Which processes have a given DLL loaded: use the *Open files* tab with *include loaded DLLs / EXE* and
+search for the DLL name.
 
 ## License
 

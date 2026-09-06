@@ -128,4 +128,62 @@ if (-not $NoSetup) {
     if ($LASTEXITCODE -ne 0) { throw "csc failed for Setup.cs ($LASTEXITCODE)" }
     Write-Host "Installer: $setup" -ForegroundColor Green
 }
+
+# ---- 6. Checksums + package manifests (scoop / winget) -----------------------------------
+$RepoOwner = 'furiouskopan'; $RepoName = 'process-inspector'; $Version = '1.1.0'
+$base = "https://github.com/$RepoOwner/$RepoName/releases/download/v$Version"
+$sums = @()
+foreach ($f in (Get-ChildItem $dist -File | Where-Object { $_.Extension -in '.zip', '.exe' })) {
+    $sums += "$((Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower())  $($f.Name)"
+}
+$sums | Set-Content (Join-Path $dist 'SHA256SUMS.txt') -Encoding ASCII
+$zipHash   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+$setupPath = Join-Path $dist 'ProcessInspector-Setup.exe'
+$setupHash = if (Test-Path $setupPath) { (Get-FileHash $setupPath -Algorithm SHA256).Hash.ToLower() } else { '' }
+
+$pk = Join-Path $root 'packaging'
+New-Item -ItemType Directory -Force -Path (Join-Path $pk 'scoop'), (Join-Path $pk 'winget') | Out-Null
+@"
+{
+    "version": "$Version",
+    "description": "See what every process is used by, which files it has open, and who is locking a file.",
+    "homepage": "https://github.com/$RepoOwner/$RepoName",
+    "license": "MIT",
+    "url": "$base/ProcessInspector-portable.zip",
+    "hash": "$zipHash",
+    "bin": "ProcessInspector.exe",
+    "shortcuts": [ [ "ProcessInspector.exe", "Process Inspector" ] ],
+    "checkver": "github",
+    "autoupdate": { "url": "https://github.com/$RepoOwner/$RepoName/releases/download/v`$version/ProcessInspector-portable.zip" }
+}
+"@ | Set-Content (Join-Path $pk 'scoop\process-inspector.json') -Encoding UTF8
+
+@"
+# Submit to https://github.com/microsoft/winget-pkgs under manifests/f/$RepoOwner/ProcessInspector/$Version/
+PackageIdentifier: $RepoOwner.ProcessInspector
+PackageVersion: $Version
+PackageName: Process Inspector
+Publisher: $RepoOwner
+License: MIT
+LicenseUrl: https://github.com/$RepoOwner/$RepoName/blob/main/LICENSE
+ShortDescription: See what every process is used by, which files it has open, and who is locking a file.
+PackageUrl: https://github.com/$RepoOwner/$RepoName
+Tags:
+- process
+- handle
+- unlocker
+- file-in-use
+Installers:
+- Architecture: x64
+  InstallerType: exe
+  Scope: user
+  InstallerUrl: $base/ProcessInspector-Setup.exe
+  InstallerSha256: $($setupHash.ToUpper())
+  InstallerSwitches:
+    Silent: -Silent -NoLaunch
+    SilentWithProgress: -Silent -NoLaunch
+ManifestType: singleton
+ManifestVersion: 1.6.0
+"@ | Set-Content (Join-Path $pk "winget\$RepoOwner.ProcessInspector.yaml") -Encoding UTF8
+Write-Host "Checksums + scoop/winget manifests written." -ForegroundColor Green
 Write-Host "Done." -ForegroundColor Green

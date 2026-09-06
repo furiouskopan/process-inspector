@@ -1,7 +1,11 @@
-// Enumerates open file handles system-wide (what handle.exe / Process Explorer do).
-// Used by ProcessInspector.ps1 and OpenFiles.ps1 via Add-Type -Path.
+// Native helpers shared by ProcessInspector.ps1 and OpenFiles.ps1 (loaded with Add-Type -Path).
+//  - HandleEnum : enumerate open file handles system-wide (what handle.exe / Process Explorer do),
+//                 and force-close a handle inside another process (what Unlocker does).
+//  - FileOps    : delete a file on the next reboot.
+//  - Row types bound to the WPF grids.
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -13,6 +17,29 @@ public class FileRow {
     public string Process { get; set; }
     public string Kind    { get; set; }
     public string File    { get; set; }
+    public long   Handle  { get; set; }
+}
+
+public class NetRow {
+    public int    PID        { get; set; }
+    public string Process    { get; set; }
+    public string Protocol   { get; set; }
+    public string LocalAddr  { get; set; }
+    public int    LocalPort  { get; set; }
+    public string RemoteAddr { get; set; }
+    public int    RemotePort { get; set; }
+    public string State      { get; set; }
+}
+
+public static class FileOps {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool MoveFileEx(string src, string dst, uint flags);
+    const uint MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
+
+    /// Schedules the file (or empty directory) for deletion at the next reboot. Needs Administrator.
+    public static void DeleteOnReboot(string path) {
+        if (!MoveFileEx(path, null, MOVEFILE_DELAY_UNTIL_REBOOT)) throw new Win32Exception();
+    }
 }
 
 public static class HandleEnum {
@@ -47,10 +74,11 @@ public static class HandleEnum {
     const int  SystemExtendedHandleInformation = 64;
     const int  STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
     const uint PROCESS_DUP_HANDLE = 0x0040;
-    const uint DUPLICATE_SAME_ACCESS = 0x0002;
+    const uint DUPLICATE_SAME_ACCESS  = 0x0002;
+    const uint DUPLICATE_CLOSE_SOURCE = 0x0001;
     const uint FILE_TYPE_DISK = 0x0001;
 
-    public class OpenFile { public int Pid; public string Path; }
+    public class OpenFile { public int Pid; public string Path; public IntPtr Handle; }
 
     static SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX[] Snapshot() {
         int len = 4 * 1024 * 1024;
@@ -122,7 +150,8 @@ public static class HandleEnum {
                     string path = sb.ToString();
                     if (path.StartsWith(@"\\?\UNC\")) path = @"\\" + path.Substring(8);
                     else if (path.StartsWith(@"\\?\")) path = path.Substring(4);
-                    if (seen.Add(p + "|" + path)) result.Add(new OpenFile { Pid = (int)p, Path = path });
+                    if (seen.Add(p + "|" + path + "|" + e.HandleValue.ToInt64()))
+                        result.Add(new OpenFile { Pid = (int)p, Path = path, Handle = e.HandleValue });
                 } finally { CloseHandle(dup); }
             }
         } finally {
@@ -137,6 +166,19 @@ public static class HandleEnum {
         if (h == IntPtr.Zero) return false;
         CloseHandle(h);
         return true;
+    }
+
+    /// Force-closes a handle that belongs to another process (Unlocker-style). The other program keeps
+    /// running but loses that file; it may misbehave if it was still using it.
+    public static void CloseRemoteHandle(int pid, long handle) {
+        IntPtr hProc = OpenProcess(PROCESS_DUP_HANDLE, false, pid);
+        if (hProc == IntPtr.Zero) throw new Win32Exception();
+        try {
+            IntPtr dup;
+            if (!DuplicateHandle(hProc, new IntPtr(handle), GetCurrentProcess(), out dup, 0, false, DUPLICATE_CLOSE_SOURCE))
+                throw new Win32Exception();
+            CloseHandle(dup);
+        } finally { CloseHandle(hProc); }
     }
 }
 }

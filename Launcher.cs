@@ -14,8 +14,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("See what every process is used by, which files it has open, and who is locking a file.")]
 [assembly: AssemblyProduct("Process Inspector")]
 [assembly: AssemblyCopyright("MIT License")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 static class Program
 {

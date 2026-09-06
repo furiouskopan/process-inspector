@@ -20,7 +20,8 @@ param(
     [switch]$Show,        # with -Tray: show the window immediately but keep tray behaviour
     [switch]$SelfTest,    # build everything, run the data functions, exit (no window shown)
     [string]$Screenshot,  # with -SelfTest: render the window to this PNG file
-    [int]$ShowTab = -1    # with -Screenshot: which tab to show
+    [int]$ShowTab = -1,   # with -Screenshot: which tab to show
+    [switch]$Dark         # with -Screenshot: render in the dark theme
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +31,12 @@ $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Wind
                   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:AppRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:ExePath = $env:PROCESS_INSPECTOR_EXE          # set by ProcessInspector.exe when hosting this script
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
+$script:RepoOwner  = 'furiouskopan'          # used by "Check for updates"
+$script:RepoName   = 'process-inspector'
+$script:CpuPrev     = @{}    # pid -> @{Cpu; Time}  for the CPU % column
+$script:PrevRows    = @{}    # pid -> ProcRow       for New / Exited highlighting
+$script:SignerCache = @{}    # exe path -> signer text
 
 # ---- Single instance: if a copy is already running, hand it our request and quit ----
 $script:IpcSuffix = if ($IsAdmin) { '.admin' } else { '' }
@@ -77,6 +83,9 @@ public class ProcRow {
     public string   ServiceNames { get; set; }   // short names, comma separated
     public string   UsedBy       { get; set; }
     public double   MemoryMB     { get; set; }
+    public double   CpuPercent   { get; set; }
+    public string   Status       { get; set; }   // "", "New", "Exited"
+    public string   Signer       { get; set; }
     public DateTime? Started     { get; set; }
     public string   Path         { get; set; }
     public string   CommandLine  { get; set; }
@@ -92,6 +101,8 @@ public class LockRow {
     public DateTime? Started     { get; set; }
     public string   Path         { get; set; }
     public string   HeldItem     { get; set; }
+    public List<long> Handles    { get; set; }   // handle values we could close remotely
+    public LockRow() { Handles = new List<long>(); }
 }
 
 public static class ProcUser {
@@ -171,6 +182,9 @@ if (-not ('WhosLocking.HandleEnum' -as [type])) { Add-Type -Path (Join-Path $App
 # =============================================================================
 function Get-ProcessRows {
     $cim   = Get-CimInstance Win32_Process
+    $now   = Get-Date
+    $cores = [Environment]::ProcessorCount
+    $cpuNow = @{}; $liveRows = @{}
     $procs = @{}
     Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procs[$_.Id] = $_ }
 
@@ -211,8 +225,33 @@ function Get-ProcessRows {
         $r.MemoryMB = [math]::Round($c.WorkingSetSize / 1MB, 1)
         if ($c.CreationDate) { $r.Started = $c.CreationDate }
         $r.CommandLine = $c.CommandLine
+        # CPU % since the previous refresh
+        if ($p) {
+            try {
+                $cpuMs = $p.TotalProcessorTime.TotalMilliseconds
+                if ($script:CpuPrev.ContainsKey($pid_)) {
+                    $prev = $script:CpuPrev[$pid_]
+                    $wall = ($now - $prev.Time).TotalMilliseconds
+                    if ($wall -gt 0) { $r.CpuPercent = [math]::Round([math]::Max(0, ($cpuMs - $prev.Cpu) / $wall / $cores * 100), 1) }
+                }
+                $cpuNow[$pid_] = @{ Cpu = $cpuMs; Time = $now }
+            } catch {}
+        }
+        if ($script:PrevRows.Count -gt 0 -and -not $script:PrevRows.ContainsKey($pid_)) { $r.Status = 'New' }
+        if ($r.Path -and $script:SignerCache.ContainsKey($r.Path)) { $r.Signer = $script:SignerCache[$r.Path] }
         $list.Add($r)
+        $liveRows[$pid_] = $r
     }
+    # processes that disappeared since the previous refresh: shown once more, greyed out
+    foreach ($k in $script:PrevRows.Keys) {
+        if (-not $liveRows.ContainsKey($k)) {
+            $old = $script:PrevRows[$k]
+            $old.Status = 'Exited'; $old.CpuPercent = 0
+            $list.Add($old)
+        }
+    }
+    $script:PrevRows = $liveRows
+    $script:CpuPrev  = $cpuNow
     return ,$list
 }
 
@@ -278,18 +317,19 @@ function Find-LockRows([string[]]$files) {
     return ,$list
 }
 
-# Handle scan: processes holding anything under a folder open (including the folder itself,
-# which is what a console window's "current directory" looks like). Merges into $rows.
-function Merge-HandleLocks($rows, [string]$folder) {
-    $base   = $folder.TrimEnd('\')
-    $prefix = $base + '\'
-    $held = @{}
+# Handle scan: processes holding any open file whose path satisfies $match. Merges into $rows and
+# records the handle values so they can be force-closed later. $dirBase (optional) marks a handle
+# on the folder itself, which is what a console window's "current directory" looks like.
+function Merge-HandleLocks($rows, [scriptblock]$match, [string]$dirBase) {
+    $held = @{}; $handles = @{}
     foreach ($f in [WhosLocking.HandleEnum]::GetFiles(-1)) {
-        if ($f.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]::Equals($f.Path, $base, [StringComparison]::OrdinalIgnoreCase)) {
-            if (-not $held.ContainsKey($f.Pid)) { $held[$f.Pid] = New-Object System.Collections.Generic.List[string] }
-            $held[$f.Pid].Add($f.Path)
+        if (-not (& $match $f.Path)) { continue }
+        if (-not $held.ContainsKey($f.Pid)) {
+            $held[$f.Pid]    = New-Object System.Collections.Generic.List[string]
+            $handles[$f.Pid] = New-Object System.Collections.Generic.List[long]
         }
+        if (-not $held[$f.Pid].Contains($f.Path)) { $held[$f.Pid].Add($f.Path) }
+        $handles[$f.Pid].Add($f.Handle.ToInt64())
     }
     $byPid = @{}
     foreach ($r in $rows) { $byPid[$r.PID] = $r }
@@ -297,15 +337,17 @@ function Merge-HandleLocks($rows, [string]$folder) {
         $items = $held[$k]
         $label = if ($items.Count -eq 1) { $items[0] } else { "$($items[0])  (+$($items.Count - 1) more)" }
         if ($byPid.ContainsKey($k)) {
-            if (-not $byPid[$k].HeldItem) { $byPid[$k].HeldItem = $label }
+            $r = $byPid[$k]
+            if (-not $r.HeldItem) { $r.HeldItem = $label }
         } else {
             $r = New-LockRow $k
             if (-not $r.Type) {
-                $r.Type = if ($items -contains $base) { 'Folder handle / working directory' } else { 'Open file handle' }
+                $r.Type = if ($dirBase -and ($items -contains $dirBase)) { 'Folder handle / working directory' } else { 'Open file handle' }
             }
             $r.HeldItem = $label
             $rows.Add($r)
         }
+        $r.Handles.AddRange($handles[$k])
     }
     return ,$rows
 }
@@ -322,7 +364,7 @@ function Get-OpenFileRows([int]$pid_, [bool]$includeModules, [hashtable]$names) 
             $names[[int]$f.Pid] = $name
         }
         $r = New-Object WhosLocking.FileRow
-        $r.PID = $f.Pid; $r.Process = $name; $r.Kind = 'Open file'; $r.File = $f.Path
+        $r.PID = $f.Pid; $r.Process = $name; $r.Kind = 'Open file'; $r.File = $f.Path; $r.Handle = $f.Handle.ToInt64()
         $list.Add($r)
     }
     if ($includeModules) {
@@ -404,47 +446,107 @@ $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Process Inspector" Width="1250" Height="760" MinWidth="800" MinHeight="500"
-        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="12" Background="#F3F3F3">
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="12" Background="{DynamicResource BgBrush}">
   <Window.Resources>
+    <!-- theme brushes; Set-Theme swaps them at run time -->
+    <SolidColorBrush x:Key="BgBrush"        Color="#F3F3F3"/>
+    <SolidColorBrush x:Key="PanelBrush"     Color="#FFFFFF"/>
+    <SolidColorBrush x:Key="AltRowBrush"    Color="#F7F9FC"/>
+    <SolidColorBrush x:Key="HeaderBrush"    Color="#EDEDED"/>
+    <SolidColorBrush x:Key="LineBrush"      Color="#CCCCCC"/>
+    <SolidColorBrush x:Key="GridLineBrush"  Color="#E3E3E3"/>
+    <SolidColorBrush x:Key="TextBrush"      Color="#1B1B1B"/>
+    <SolidColorBrush x:Key="MutedBrush"     Color="#666666"/>
+    <SolidColorBrush x:Key="StatusBrush"    Color="#E8E8E8"/>
+    <SolidColorBrush x:Key="NewRowBrush"    Color="#DDF5DD"/>
+    <SolidColorBrush x:Key="ExitedRowBrush" Color="#F9DADA"/>
+    <SolidColorBrush x:Key="ButtonBrush"    Color="#E6E6E6"/>
+
     <Style TargetType="Button">
       <Setter Property="Padding" Value="12,5"/>
       <Setter Property="Margin" Value="6,0,0,0"/>
       <Setter Property="MinWidth" Value="90"/>
+      <Setter Property="Background" Value="{DynamicResource ButtonBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
+    </Style>
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
     </Style>
     <Style TargetType="TextBox">
       <Setter Property="Padding" Value="6,4"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Background" Value="{DynamicResource PanelBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
+      <Setter Property="CaretBrush" Value="{DynamicResource TextBrush}"/>
+    </Style>
+    <Style TargetType="GroupBox">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
+    </Style>
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="{DynamicResource BgBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
+    </Style>
+    <Style TargetType="TabItem">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="bd" Background="{DynamicResource HeaderBrush}" BorderBrush="{DynamicResource LineBrush}"
+                    BorderThickness="1,1,1,0" Margin="0,2,-1,0" Padding="14,5">
+              <ContentPresenter ContentSource="Header" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="{DynamicResource BgBrush}"/>
+                <Setter TargetName="bd" Property="Margin" Value="0,0,-1,-1"/>
+                <Setter TargetName="bd" Property="Padding" Value="14,6,14,7"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style TargetType="DataGrid">
       <Setter Property="AutoGenerateColumns" Value="False"/>
       <Setter Property="IsReadOnly" Value="True"/>
       <Setter Property="GridLinesVisibility" Value="Horizontal"/>
-      <Setter Property="HorizontalGridLinesBrush" Value="#E3E3E3"/>
-      <Setter Property="AlternatingRowBackground" Value="#F7F9FC"/>
-      <Setter Property="Background" Value="White"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource GridLineBrush}"/>
+      <Setter Property="RowBackground" Value="{DynamicResource PanelBrush}"/>
+      <Setter Property="AlternatingRowBackground" Value="{DynamicResource AltRowBrush}"/>
+      <Setter Property="Background" Value="{DynamicResource PanelBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
       <Setter Property="HeadersVisibility" Value="Column"/>
       <Setter Property="RowHeaderWidth" Value="0"/>
       <Setter Property="SelectionMode" Value="Extended"/>
       <Setter Property="CanUserAddRows" Value="False"/>
-      <Setter Property="BorderBrush" Value="#CCCCCC"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
       <Setter Property="RowHeight" Value="24"/>
     </Style>
     <Style TargetType="DataGridColumnHeader">
       <Setter Property="Padding" Value="6,4"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="Background" Value="#EDEDED"/>
-      <Setter Property="BorderBrush" Value="#CCCCCC"/>
+      <Setter Property="Background" Value="{DynamicResource HeaderBrush}"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource LineBrush}"/>
       <Setter Property="BorderThickness" Value="0,0,1,1"/>
     </Style>
-    <Style TargetType="DataGridCell">
+    <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
       <Setter Property="Padding" Value="4,0"/>
       <Setter Property="BorderThickness" Value="0"/>
     </Style>
   </Window.Resources>
 
-  <DockPanel>
-    <Border DockPanel.Dock="Bottom" Background="#E8E8E8" Padding="8,4">
-      <TextBlock x:Name="txtStatus" Text="Ready"/>
+  <DockPanel TextElement.Foreground="{DynamicResource TextBrush}">
+    <Border DockPanel.Dock="Bottom" Background="{DynamicResource StatusBrush}" Padding="8,3">
+      <DockPanel>
+        <Button x:Name="btnUpdates" DockPanel.Dock="Right" Content="Check for updates" MinWidth="0" Padding="8,2" FontSize="11"/>
+        <CheckBox x:Name="chkDark" DockPanel.Dock="Right" Content="Dark theme" Margin="0,0,10,0"/>
+        <TextBlock x:Name="txtStatus" Text="Ready" VerticalAlignment="Center"/>
+      </DockPanel>
     </Border>
 
     <TabControl x:Name="tabs" Margin="8">
@@ -464,19 +566,24 @@ $xaml = @'
             <Button x:Name="btnOpenLoc"  DockPanel.Dock="Right" Content="Open file location"/>
             <Button x:Name="btnKillProc" DockPanel.Dock="Right" Content="End process"/>
             <Button x:Name="btnRefresh"  DockPanel.Dock="Right" Content="Refresh"/>
+            <CheckBox x:Name="chkAutoRefresh" DockPanel.Dock="Right" Content="Auto-refresh (3 s)" Margin="12,0,0,0"
+                      ToolTip="Refreshes every 3 seconds. New processes are shown green, exited ones red for one cycle."/>
             <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
             <TextBox x:Name="txtSearch"/>
           </DockPanel>
 
-          <DataGrid x:Name="gridProcs" Grid.Row="1">
+          <DataGrid x:Name="gridProcs" Grid.Row="1" AlternationCount="2" AlternatingRowBackground="{x:Null}">
+            <!-- RowStyle (alternation + New/Exited colours) is built in code by Set-Theme -->
             <DataGrid.Columns>
               <DataGridTextColumn Header="PID"         Binding="{Binding PID}"         Width="60"/>
-              <DataGridTextColumn Header="Name"        Binding="{Binding Name}"        Width="160"/>
-              <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="200"/>
-              <DataGridTextColumn Header="User"        Binding="{Binding User}"        Width="150"/>
-              <DataGridTextColumn Header="Used by / started by" Binding="{Binding UsedBy}" Width="320"/>
-              <DataGridTextColumn Header="Memory (MB)" Binding="{Binding MemoryMB}"    Width="90"/>
-              <DataGridTextColumn Header="Started"     Binding="{Binding Started, StringFormat=g}" Width="130"/>
+              <DataGridTextColumn Header="Name"        Binding="{Binding Name}"        Width="150"/>
+              <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="180"/>
+              <DataGridTextColumn Header="CPU %"       Binding="{Binding CpuPercent, StringFormat={}{0:N1}}" Width="60"/>
+              <DataGridTextColumn Header="Memory (MB)" Binding="{Binding MemoryMB}"    Width="95"/>
+              <DataGridTextColumn Header="User"        Binding="{Binding User}"        Width="140"/>
+              <DataGridTextColumn Header="Used by / started by" Binding="{Binding UsedBy}" Width="270"/>
+              <DataGridTextColumn Header="Signer"      Binding="{Binding Signer}"      Width="150"/>
+              <DataGridTextColumn Header="Started"     Binding="{Binding Started, StringFormat=g}" Width="125"/>
               <DataGridTextColumn Header="Path"        Binding="{Binding Path}"        Width="*"/>
             </DataGrid.Columns>
           </DataGrid>
@@ -525,7 +632,7 @@ $xaml = @'
             <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
             <TextBox x:Name="txtFileSearch"/>
           </DockPanel>
-          <TextBlock Grid.Row="1" x:Name="txtAllFilesInfo" Foreground="#666" Margin="0,0,0,8"
+          <TextBlock Grid.Row="1" x:Name="txtAllFilesInfo" Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,8"
                      Text="Click 'Load / refresh' to list every file every process has open right now. Type part of a file name, folder or process name to filter. Double-click a row to jump to that process."/>
           <DataGrid x:Name="gridAllFiles" Grid.Row="2">
             <DataGrid.Columns>
@@ -556,7 +663,7 @@ $xaml = @'
             <TextBox x:Name="txtPath" AllowDrop="True"/>
           </DockPanel>
           <TextBlock Grid.Row="1" Text="Tip: you can also drag a file or folder from Explorer onto the box above."
-                     Foreground="#666" Margin="0,0,0,8"/>
+                     Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,8"/>
 
           <DataGrid x:Name="gridLock" Grid.Row="2">
             <DataGrid.Columns>
@@ -575,8 +682,38 @@ $xaml = @'
             <Button x:Name="btnAdmin2"     DockPanel.Dock="Right" Content="Restart as Administrator"/>
             <Button x:Name="btnShowInList" DockPanel.Dock="Right" Content="Show in Processes tab"/>
             <Button x:Name="btnKillLock"   DockPanel.Dock="Right" Content="End process / stop service"/>
-            <TextBlock x:Name="txtLockInfo" VerticalAlignment="Center" Foreground="#444"/>
+            <TextBlock x:Name="txtLockInfo" VerticalAlignment="Center" TextWrapping="Wrap"/>
           </DockPanel>
+        </Grid>
+      </TabItem>
+
+      <!-- ================= Network ================= -->
+      <TabItem Header="   Network   ">
+        <Grid Margin="8">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <DockPanel Grid.Row="0" Margin="0,0,0,6">
+            <Button x:Name="btnNetRefresh" DockPanel.Dock="Right" Content="Load / refresh" FontWeight="SemiBold"/>
+            <TextBlock Text="Search:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <TextBox x:Name="txtNetSearch"/>
+          </DockPanel>
+          <TextBlock Grid.Row="1" x:Name="txtNetInfo" Foreground="{DynamicResource MutedBrush}" Margin="0,0,0,8"
+                     Text="TCP connections and UDP listeners of every process. Search by process, address, port or state. Double-click a row to jump to the process."/>
+          <DataGrid x:Name="gridNet" Grid.Row="2">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="PID"            Binding="{Binding PID}"        Width="60"/>
+              <DataGridTextColumn Header="Process"        Binding="{Binding Process}"    Width="160"/>
+              <DataGridTextColumn Header="Protocol"       Binding="{Binding Protocol}"   Width="70"/>
+              <DataGridTextColumn Header="Local address"  Binding="{Binding LocalAddr}"  Width="160"/>
+              <DataGridTextColumn Header="Local port"     Binding="{Binding LocalPort}"  Width="80"/>
+              <DataGridTextColumn Header="Remote address" Binding="{Binding RemoteAddr}" Width="160"/>
+              <DataGridTextColumn Header="Remote port"    Binding="{Binding RemotePort}" Width="90"/>
+              <DataGridTextColumn Header="State"          Binding="{Binding State}"      Width="*"/>
+            </DataGrid.Columns>
+          </DataGrid>
         </Grid>
       </TabItem>
 
@@ -589,7 +726,8 @@ $script:window = [Windows.Markup.XamlReader]::Parse($xaml)
 $ui = @{}
 foreach ($n in 'txtStatus','tabs','btnAdmin','btnOpenLoc','btnKillProc','btnRefresh','txtSearch','gridProcs','txtDetails',
                'btnCheck','btnBrowseFolder','btnBrowseFile','txtPath','gridLock','btnAdmin2','btnShowInList','btnKillLock','txtLockInfo',
-               'txtFilesHeader','chkModules','gridFiles','btnLoadAllFiles','chkAllModules','txtFileSearch','txtAllFilesInfo','gridAllFiles') {
+               'txtFilesHeader','chkModules','gridFiles','btnLoadAllFiles','chkAllModules','txtFileSearch','txtAllFilesInfo','gridAllFiles',
+               'chkAutoRefresh','chkDark','btnUpdates','btnNetRefresh','txtNetSearch','txtNetInfo','gridNet') {
     $ui[$n] = $window.FindName($n)
 }
 if ($IsAdmin) {
@@ -610,6 +748,102 @@ function Test-Match([string]$text, [string]$q) {
     return ($null -ne $text -and $text.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
+# ---- Theme + settings ---------------------------------------------------------------
+$script:Palette = @{
+    light = @{ BgBrush='#F3F3F3'; PanelBrush='#FFFFFF'; AltRowBrush='#F7F9FC'; HeaderBrush='#EDEDED'; LineBrush='#CCCCCC'
+               GridLineBrush='#E3E3E3'; TextBrush='#1B1B1B'; MutedBrush='#666666'; StatusBrush='#E8E8E8'
+               NewRowBrush='#DDF5DD'; ExitedRowBrush='#F9DADA'; ButtonBrush='#E6E6E6' }
+    dark  = @{ BgBrush='#1E1E1E'; PanelBrush='#262626'; AltRowBrush='#2C2C2C'; HeaderBrush='#333333'; LineBrush='#464646'
+               GridLineBrush='#353535'; TextBrush='#E4E4E4'; MutedBrush='#9C9C9C'; StatusBrush='#2A2A2A'
+               NewRowBrush='#22402A'; ExitedRowBrush='#4B2323'; ButtonBrush='#3A3A3A' }
+}
+function Set-Theme([bool]$dark) {
+    $pal = if ($dark) { $Palette.dark } else { $Palette.light }
+    foreach ($k in $pal.Keys) {
+        $b = New-Object System.Windows.Media.SolidColorBrush
+        $b.Color = [System.Windows.Media.ColorConverter]::ConvertFromString($pal[$k])
+        $b.Freeze()
+        # .BaseObject: the untyped indexer would otherwise receive PowerShell's PSObject wrapper,
+        # which WPF rejects as "not a valid value for property Foreground"
+        $window.Resources[$k] = $b.psobject.BaseObject
+    }
+    $script:IsDark = $dark
+    # Trigger setters resolve a DynamicResource only once, so the row style is rebuilt with
+    # concrete colours: alternating rows, plus green "New" / red "Exited" rows.
+    $rowStyle = @"
+<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="DataGridRow">
+  <Style.Triggers>
+    <Trigger Property="AlternationIndex" Value="1"><Setter Property="Background" Value="$($pal.AltRowBrush)"/></Trigger>
+    <DataTrigger Binding="{Binding Status}" Value="New"><Setter Property="Background" Value="$($pal.NewRowBrush)"/></DataTrigger>
+    <DataTrigger Binding="{Binding Status}" Value="Exited">
+      <Setter Property="Background" Value="$($pal.ExitedRowBrush)"/>
+      <Setter Property="Foreground" Value="$($pal.MutedBrush)"/>
+    </DataTrigger>
+  </Style.Triggers>
+</Style>
+"@
+    $ui.gridProcs.RowStyle = [Windows.Markup.XamlReader]::Parse($rowStyle)
+}
+Set-Theme $false
+
+$script:SettingsFile = Join-Path $IpcDir 'settings.json'
+$script:Settings = @{ dark = $false; autoRefresh = $false; width = 0; height = 0; left = -99999; top = -99999 }
+function Load-Settings {
+    try {
+        if (Test-Path $SettingsFile) {
+            $j = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+            foreach ($p in $j.PSObject.Properties) { $Settings[$p.Name] = $p.Value }
+        }
+    } catch {}
+}
+function Save-Settings {
+    try {
+        $Settings.dark        = [bool]$ui.chkDark.IsChecked
+        $Settings.autoRefresh = [bool]$ui.chkAutoRefresh.IsChecked
+        if ($window.WindowState -eq 'Normal' -and $window.ActualWidth -gt 0) {
+            $Settings.width = [int]$window.ActualWidth; $Settings.height = [int]$window.ActualHeight
+            $Settings.left  = [int]$window.Left;        $Settings.top    = [int]$window.Top
+        }
+        New-Item -ItemType Directory -Force -Path $IpcDir | Out-Null
+        $Settings | ConvertTo-Json | Set-Content -Path $SettingsFile -Encoding UTF8
+    } catch {}
+}
+function Apply-Settings {
+    Load-Settings
+    $ui.chkDark.IsChecked = [bool]$Settings.dark
+    Set-Theme ([bool]$Settings.dark)
+    $ui.chkAutoRefresh.IsChecked = [bool]$Settings.autoRefresh
+    if ($Settings.width -ge 800 -and $Settings.height -ge 500) {
+        $wa = [System.Windows.SystemParameters]::VirtualScreenWidth
+        if ($Settings.left -gt -10000 -and $Settings.left -lt $wa -and $Settings.top -gt -10000) {
+            $window.WindowStartupLocation = 'Manual'
+            $window.Left = $Settings.left; $window.Top = $Settings.top
+        }
+        $window.Width = [Math]::Min($Settings.width, [System.Windows.SystemParameters]::WorkArea.Width)
+        $window.Height = [Math]::Min($Settings.height, [System.Windows.SystemParameters]::WorkArea.Height)
+    }
+}
+
+# ---- Update check (GitHub Releases) -----------------------------------------------------
+function Check-Updates {
+    Show-Status 'Checking GitHub for a newer version...'
+    $window.Cursor = 'Wait'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest" `
+                                 -Headers @{ 'User-Agent' = "ProcessInspector/$AppVersion" } -TimeoutSec 10
+        $latest = [version](($rel.tag_name -replace '^v', '') -replace '[^\d.].*$', '')
+        if ($latest -gt [version]$AppVersion) {
+            $ans = [System.Windows.MessageBox]::Show("Version $latest is available (you have $AppVersion).`n`nOpen the download page?", 'Update available', 'YesNo', 'Information')
+            if ($ans -eq 'Yes') { Start-Process $rel.html_url }
+        } else {
+            [System.Windows.MessageBox]::Show("You have the latest version ($AppVersion).", 'Up to date', 'OK', 'Information') | Out-Null
+        }
+    } catch {
+        [System.Windows.MessageBox]::Show("Could not check for updates.`n`n$($_.Exception.Message)`n`n(No internet connection, or the project has not published a release yet.)", 'Check for updates', 'OK', 'Warning') | Out-Null
+    } finally { $window.Cursor = $null; Show-Status 'Ready' }
+}
+
 function Show-Status([string]$t) { $ui.txtStatus.Text = $t; $ui.txtStatus.Dispatcher.Invoke([action]{}, 'Render') }
 
 # ---- Processes tab ------------------------------------------------------------
@@ -623,16 +857,57 @@ $script:ProcFilter = [Predicate[object]]{
             [string]$o.PID -eq $q -or (Test-Match $o.CommandLine $q))
 }
 
+function Find-Child($parent, [type]$type) {
+    if (-not $parent) { return $null }
+    $n = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($parent)
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = [System.Windows.Media.VisualTreeHelper]::GetChild($parent, $i)
+        if ($c -is $type) { return $c }
+        $r = Find-Child $c $type
+        if ($r) { return $r }
+    }
+    return $null
+}
+
+# Authenticode signer of an exe, cached per path ("Unsigned" / "Invalid (...)" / signer name).
+function Get-SignerText([string]$p) {
+    if (-not $p) { return '' }
+    if ($SignerCache.ContainsKey($p)) { return $SignerCache[$p] }
+    $t = ''
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop
+        switch ([string]$sig.Status) {
+            'Valid'     { $t = $sig.SignerCertificate.Subject; if ($t -match 'CN=("[^"]+"|[^,]+)') { $t = $matches[1].Trim('"') } }
+            'NotSigned' { $t = 'Unsigned' }
+            default     { $t = "Invalid ($($sig.Status))" }
+        }
+    } catch { $t = '' }
+    $SignerCache[$p] = $t
+    return $t
+}
+function Update-Signers {
+    if (-not $script:AllProcs) { return }
+    $todo = @{}
+    foreach ($r in $AllProcs) { if ($r.Path -and -not $r.Signer -and -not $SignerCache.ContainsKey($r.Path)) { $todo[$r.Path] = $true } }
+    if ($todo.Count -eq 0) { return }
+    Show-Status "Checking signatures of $($todo.Count) program(s)..."
+    foreach ($p in @($todo.Keys)) { $null = Get-SignerText $p }
+    foreach ($r in $AllProcs) { if ($r.Path -and -not $r.Signer) { $r.Signer = $SignerCache[$r.Path] } }
+    $ui.gridProcs.Items.Refresh()
+    Update-ProcCount
+}
+
 $script:LoadingProcs = $false
-function Load-Processes {
+function Load-Processes([switch]$Auto) {
     if ($LoadingProcs) { return }          # a click during the wait cursor must not re-enter
     $script:LoadingProcs = $true
-    Show-Status 'Collecting processes...'
-    $window.Cursor = 'Wait'
+    if (-not $Auto) { Show-Status 'Collecting processes...'; $window.Cursor = 'Wait' }
     try {
-        # remember selection + sort so a refresh does not throw them away
+        # remember selection, sort and scroll position so a refresh does not throw them away
         $selPid = $null; if ($ui.gridProcs.SelectedItem) { $selPid = $ui.gridProcs.SelectedItem.PID }
         $sortCols = @($ui.gridProcs.Columns | Where-Object { $_.SortDirection -ne $null })
+        $sv = Find-Child $ui.gridProcs ([System.Windows.Controls.ScrollViewer])
+        $offset = if ($sv) { $sv.VerticalOffset } else { 0 }
 
         $script:AllProcs = Get-ProcessRows
         $ui.gridProcs.ItemsSource = $AllProcs
@@ -644,9 +919,15 @@ function Load-Processes {
         }
         if ($null -ne $selPid) {
             $again = $AllProcs | Where-Object { $_.PID -eq $selPid } | Select-Object -First 1
-            if ($again) { $ui.gridProcs.SelectedItem = $again; $ui.gridProcs.ScrollIntoView($again) }
+            if ($again) { $ui.gridProcs.SelectedItem = $again; if (-not $Auto) { $ui.gridProcs.ScrollIntoView($again) } }
+        }
+        if ($sv -and $offset -gt 0) {
+            $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Loaded,
+                [action]{ $sv.ScrollToVerticalOffset($offset) }.GetNewClosure()) | Out-Null
         }
         Update-ProcCount
+        # signatures are checked after the list is on screen (one-time cost per new program)
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{ Update-Signers }) | Out-Null
     } finally { $window.Cursor = $null; $script:LoadingProcs = $false }
 }
 function Update-ProcCount {
@@ -664,9 +945,20 @@ $ui.txtSearch.Add_TextChanged({
 $ui.btnRefresh.Add_Click({ Load-Processes })
 $ui.btnAdmin.Add_Click({ Restart-Elevated $ui.txtPath.Text })
 $ui.btnAdmin2.Add_Click({ Restart-Elevated $ui.txtPath.Text })
+$ui.btnUpdates.Add_Click({ Check-Updates })
+$ui.chkDark.Add_Click({ Set-Theme ([bool]$ui.chkDark.IsChecked); Save-Settings })
 
-$ui.gridProcs.Add_SelectionChanged({
-    $r = $ui.gridProcs.SelectedItem
+$script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
+$AutoTimer.Interval = [TimeSpan]::FromSeconds(3)
+$AutoTimer.Add_Tick({
+    if ($window.IsVisible -and $ui.tabs.SelectedIndex -eq 0 -and -not $LoadingProcs) { Load-Processes -Auto }
+})
+$ui.chkAutoRefresh.Add_Click({
+    if ($ui.chkAutoRefresh.IsChecked) { $AutoTimer.Start() } else { $AutoTimer.Stop() }
+    Save-Settings
+})
+
+function Show-Details($r) {
     if (-not $r) { $ui.txtDetails.Text = ''; return }
     $lines = @(
         "$($r.Name)  (PID $($r.PID))   $($r.Description)   $($r.Company)"
@@ -674,12 +966,24 @@ $ui.gridProcs.Add_SelectionChanged({
         "Started by:  $($r.Parent)"
         "Services:    $($r.Services)"
         "Started:     $($r.Started)"
+        "Signer:      $(if ($r.Signer) { $r.Signer } elseif ($r.Path) { Get-SignerText $r.Path } else { '' })"
         "Path:        $($r.Path)"
         "Command:     $($r.CommandLine)"
     )
     $ui.txtDetails.Text = $lines -join "`n"
-    # debounce: arrow-keying through the list must not scan handles on every step
-    $FilesTimer.Stop(); $FilesTimer.Start()
+}
+
+$script:LastFilesPid = -1
+$ui.gridProcs.Add_SelectionChanged({
+    $r = $ui.gridProcs.SelectedItem
+    Show-Details $r
+    # debounce: arrow-keying through the list must not scan handles on every step,
+    # and an auto-refresh that re-selects the same process must not rescan at all
+    if (-not $r) {
+        if ($LoadingProcs) { return }          # a refresh clears and then restores the selection
+        $FilesTimer.Stop(); Load-SelectedFiles; return
+    }
+    if ($r.PID -ne $LastFilesPid) { $FilesTimer.Stop(); $FilesTimer.Start() }
 })
 $script:FilesTimer = New-Object System.Windows.Threading.DispatcherTimer
 $FilesTimer.Interval = [TimeSpan]::FromMilliseconds(250)
@@ -694,7 +998,8 @@ function Get-NameMap {
 function Load-SelectedFiles {
     $r = $ui.gridProcs.SelectedItem
     $ui.gridFiles.ItemsSource = $null
-    if (-not $r) { $ui.txtFilesHeader.Text = 'Files used by selected process'; return }
+    if (-not $r) { $ui.txtFilesHeader.Text = 'Files used by selected process'; $script:LastFilesPid = -1; return }
+    $script:LastFilesPid = $r.PID
     try {
         $rows = Get-OpenFileRows $r.PID ([bool]$ui.chkModules.IsChecked) (Get-NameMap)
         $ui.gridFiles.ItemsSource = $rows
@@ -730,23 +1035,38 @@ function Run-LockCheck {
     $script:CheckingLock = $true
     $window.Cursor = 'Wait'
     try {
-        if (-not (Test-Path -LiteralPath $p)) { throw "Not found: $p" }
-        $item  = Get-Item -LiteralPath $p -Force
-        $isDir = $item.PSIsContainer
+        $partial = -not (Test-Path -LiteralPath $p)
         try {
-            if ($isDir) {
-                Show-Status 'Collecting files...'
-                $files   = Get-FilesUnder $item.FullName
-                $rmFiles = @($files | Where-Object { $ImageExt -contains [IO.Path]::GetExtension($_).ToLowerInvariant() })
-                Show-Status "Checking $($rmFiles.Count) program file(s)..."
-                $rows = Find-LockRows $rmFiles
-                Show-Status 'Scanning open handles under the folder...'
-                $rows = Merge-HandleLocks $rows $item.FullName
-                $what = "folder ($($files.Count) files)"
+            if ($partial) {
+                # not an existing path: treat the text as a partial name and search every open handle
+                Show-Status "Searching open handles for '$p'..."
+                $script:LockQ = $p
+                $rows = Merge-HandleLocks (New-Object 'System.Collections.Generic.List[WhosLocking.LockRow]') { param($path) Test-Match $path $script:LockQ } $null
+                $what = "open handles matching '$p'"
             } else {
-                Show-Status 'Checking...'
-                $rows = Find-LockRows @($item.FullName)
-                $what = 'file'
+                $item  = Get-Item -LiteralPath $p -Force
+                $isDir = $item.PSIsContainer
+                $full  = $item.FullName.TrimEnd('\')
+                if ($isDir) {
+                    Show-Status 'Collecting files...'
+                    $files   = Get-FilesUnder $full
+                    $rmFiles = @($files | Where-Object { $ImageExt -contains [IO.Path]::GetExtension($_).ToLowerInvariant() })
+                    Show-Status "Checking $($rmFiles.Count) program file(s)..."
+                    $rows = Find-LockRows $rmFiles
+                    Show-Status 'Scanning open handles under the folder...'
+                    $script:LockFull = $full; $script:LockPrefix = $full + '\'
+                    $rows = Merge-HandleLocks $rows { param($path)
+                        $path.StartsWith($script:LockPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                        [string]::Equals($path, $script:LockFull, [StringComparison]::OrdinalIgnoreCase) } $full
+                    $what = "folder ($($files.Count) files)"
+                } else {
+                    Show-Status 'Checking...'
+                    $rows = Find-LockRows @($full)
+                    Show-Status 'Scanning open handles...'
+                    $script:LockFull = $full
+                    $rows = Merge-HandleLocks $rows { param($path) [string]::Equals($path, $script:LockFull, [StringComparison]::OrdinalIgnoreCase) } $null
+                    $what = 'file'
+                }
             }
         } catch {
             $m = $_.Exception.Message
@@ -762,10 +1082,11 @@ function Run-LockCheck {
             throw
         }
         $ui.gridLock.ItemsSource = $rows
+        $note = if ($partial) { "Not an existing path, so every open handle was searched for '$p'. " } else { '' }
         if ($rows.Count -eq 0) {
-            $ui.txtLockInfo.Text = 'No process is holding it open' + $(if (-not $IsAdmin) { ' (as far as a non-admin can see - services and other users are hidden).' } else { '.' })
+            $ui.txtLockInfo.Text = $note + 'No process is holding it open' + $(if (-not $IsAdmin) { ' (as far as a non-admin can see - services and other users are hidden).' } else { '.' })
         } else {
-            $ui.txtLockInfo.Text = "Held open by $($rows.Count) process(es). Select one and click 'End process / stop service' to release it."
+            $ui.txtLockInfo.Text = $note + "Held open by $($rows.Count) process(es). Right-click a row for options: end it, or release just the file."
         }
         Show-Status "Checked $what."
     } catch {
@@ -855,6 +1176,190 @@ $ui.gridAllFiles.Add_MouseDoubleClick({
     if ($r) { $ui.txtSearch.Text = [string]$r.PID; $ui.tabs.SelectedIndex = 0 }
 })
 
+# ---- Network tab ------------------------------------------------------------------------
+function Resolve-ProcName([hashtable]$names, [int]$pid_) {
+    $n = $names[$pid_]
+    if (-not $n) {
+        if ($pid_ -eq 0) { $n = 'System Idle / unowned' }
+        elseif ($pid_ -eq 4) { $n = 'System' }
+        else {
+            $gp = Get-Process -Id $pid_ -ErrorAction SilentlyContinue
+            $n = if ($gp) { $gp.ProcessName + '.exe' } else { "(pid $pid_)" }
+        }
+        $names[$pid_] = $n
+    }
+    return $n
+}
+function Get-NetRows([hashtable]$names) {
+    $list = New-Object 'System.Collections.Generic.List[WhosLocking.NetRow]'
+    $tcp = @(); $udp = @()
+    try { $tcp = @(Get-NetTCPConnection -ErrorAction Stop) } catch {}
+    try { $udp = @(Get-NetUDPEndpoint -ErrorAction Stop) } catch {}
+    foreach ($c in $tcp) {
+        $r = New-Object WhosLocking.NetRow
+        $r.PID = [int]$c.OwningProcess; $r.Process = Resolve-ProcName $names $r.PID
+        $r.Protocol = 'TCP'; $r.LocalAddr = $c.LocalAddress; $r.LocalPort = [int]$c.LocalPort
+        $r.RemoteAddr = $c.RemoteAddress; $r.RemotePort = [int]$c.RemotePort; $r.State = [string]$c.State
+        $list.Add($r)
+    }
+    foreach ($u in $udp) {
+        $r = New-Object WhosLocking.NetRow
+        $r.PID = [int]$u.OwningProcess; $r.Process = Resolve-ProcName $names $r.PID
+        $r.Protocol = 'UDP'; $r.LocalAddr = $u.LocalAddress; $r.LocalPort = [int]$u.LocalPort
+        $r.RemoteAddr = '*'; $r.RemotePort = 0; $r.State = 'Listening'
+        $list.Add($r)
+    }
+    return ,$list
+}
+$script:NetFilter = [Predicate[object]]{
+    param($o)
+    $q = $ui.txtNetSearch.Text
+    if ([string]::IsNullOrWhiteSpace($q)) { return $true }
+    $q = $q.Trim()
+    return ((Test-Match $o.Process $q) -or (Test-Match $o.LocalAddr $q) -or (Test-Match $o.RemoteAddr $q) -or
+            (Test-Match $o.State $q) -or [string]$o.PID -eq $q -or [string]$o.LocalPort -eq $q -or [string]$o.RemotePort -eq $q)
+}
+function Update-NetCount {
+    if (-not $ui.gridNet.ItemsSource) { return }
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridNet.ItemsSource)
+    $shown = 0; foreach ($x in $view) { $shown++ }
+    $ui.txtNetInfo.Text = "$shown of $($ui.gridNet.ItemsSource.Count) connection(s) / listener(s)."
+}
+$script:LoadingNet = $false
+function Load-Net {
+    if ($LoadingNet) { return }
+    $script:LoadingNet = $true
+    if (-not $script:AllProcs) { Load-Processes }
+    Show-Status 'Reading TCP/UDP tables...'
+    $window.Cursor = 'Wait'
+    try {
+        $rows = Get-NetRows (Get-NameMap)
+        $ui.gridNet.ItemsSource = $rows
+        $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridNet.ItemsSource)
+        $view.Filter = $NetFilter
+        if ($view.SortDescriptions.Count -eq 0) {
+            $view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription('Process', 'Ascending')))
+            $view.SortDescriptions.Add((New-Object System.ComponentModel.SortDescription('Protocol', 'Ascending')))
+        }
+        Update-NetCount
+        Show-Status 'Network connections loaded.'
+    } catch {
+        $ui.txtNetInfo.Text = "Error: $($_.Exception.Message)"
+        Show-Status 'Error'
+    } finally { $window.Cursor = $null; $script:LoadingNet = $false }
+}
+function Goto-Net([int]$pid_) {
+    if (-not $ui.gridNet.ItemsSource) { Load-Net }
+    $ui.txtNetSearch.Text = [string]$pid_; $ui.tabs.SelectedIndex = 3
+}
+$ui.btnNetRefresh.Add_Click({ Load-Net })
+$ui.txtNetSearch.Add_TextChanged({
+    if ($ui.gridNet.ItemsSource) { [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridNet.ItemsSource).Refresh(); Update-NetCount }
+})
+$ui.gridNet.Add_MouseDoubleClick({ $r = $ui.gridNet.SelectedItem; if ($r) { Goto-Process $r.PID } })
+
+# ---- Actions shared by the menus --------------------------------------------------------
+function Export-Grid($grid, [string]$name) {
+    if (-not $grid.ItemsSource) { Show-Status 'Nothing to export - load the list first.'; return }
+    $d = New-Object Microsoft.Win32.SaveFileDialog
+    $d.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+    $d.FileName = "$name-$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
+    if (-not $d.ShowDialog($window)) { return }
+    $view  = [System.Windows.Data.CollectionViewSource]::GetDefaultView($grid.ItemsSource)
+    $items = @(foreach ($x in $view) { $x })        # what is on screen: filtered and sorted
+    $props = @($grid.Columns | ForEach-Object { $_.SortMemberPath } | Where-Object { $_ })
+    $items | Select-Object $props | Export-Csv -LiteralPath $d.FileName -NoTypeInformation -Encoding UTF8
+    Show-Status "Exported $($items.Count) row(s) to $($d.FileName)"
+}
+function Copy-GridTable($grid, [switch]$SelectedOnly) {
+    if (-not $grid.ItemsSource) { return }
+    $props = @($grid.Columns | ForEach-Object { $_.SortMemberPath } | Where-Object { $_ })
+    $items = if ($SelectedOnly -and $grid.SelectedItems.Count -gt 0) { @($grid.SelectedItems) }
+             else { $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($grid.ItemsSource); @(foreach ($x in $view) { $x }) }
+    $sb = New-Object System.Text.StringBuilder
+    $null = $sb.AppendLine(($grid.Columns | ForEach-Object { [string]$_.Header }) -join "`t")
+    foreach ($it in $items) { $null = $sb.AppendLine(($props | ForEach-Object { [string]$it.$_ }) -join "`t") }
+    Copy-Text $sb.ToString()
+    Show-Status "Copied $($items.Count) row(s) as a table."
+}
+
+# Force-close handles inside another process (Unlocker style).
+function Close-RemoteHandles([int]$pid_, [string]$procName, $handles, [string]$what) {
+    $handles = @($handles)
+    if ($handles.Count -eq 0) { Show-Status 'No closable handle known for that row.'; return $false }
+    $msg = "Force-close $($handles.Count) handle(s) that $procName (PID $pid_) holds on:`n$what`n`n" +
+           "The program keeps running but loses the file. If it was still writing to it, the file can end up corrupted " +
+           "or the program can misbehave. Use this for stuck files, not for databases or documents being edited.`n`nContinue?"
+    $ans = [System.Windows.MessageBox]::Show($msg, 'Release file', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return $false }
+    $problems = @()
+    foreach ($h in $handles) {
+        try { [WhosLocking.HandleEnum]::CloseRemoteHandle($pid_, [long]$h) }
+        catch { $problems += "Handle 0x$([Convert]::ToString([long]$h, 16)): $($_.Exception.Message)" }
+    }
+    if ($problems) {
+        $extra = if (-not $IsAdmin) { "`n`nTry Restart as Administrator." } else { '' }
+        [System.Windows.MessageBox]::Show(($problems -join "`n") + $extra, 'Some handles could not be closed', 'OK', 'Warning') | Out-Null
+    } else { Show-Status "Released: $what" }
+    return $true
+}
+function Schedule-DeleteOnReboot([string]$p) {
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { Show-Status 'Enter an existing file path first.'; return }
+    $isDir = (Get-Item -LiteralPath $p -Force).PSIsContainer
+    $ans = [System.Windows.MessageBox]::Show("Delete this on the next restart, before any program can lock it?`n`n$p" +
+        $(if ($isDir) { "`n`n(Only empty folders can be scheduled. Files inside must be scheduled first.)" } else { '' }),
+        'Delete on next reboot', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return }
+    try {
+        [WhosLocking.FileOps]::DeleteOnReboot($p)
+        [System.Windows.MessageBox]::Show("Scheduled. It will be removed during the next restart.", 'Delete on next reboot', 'OK', 'Information') | Out-Null
+    } catch {
+        $m = $_.Exception.Message; if ($_.Exception.InnerException) { $m = $_.Exception.InnerException.Message }
+        $extra = if (-not $IsAdmin) { "`n`nThis needs Administrator rights - use Restart as Administrator." } else { '' }
+        [System.Windows.MessageBox]::Show("Could not schedule: $m$extra", 'Delete on next reboot', 'OK', 'Error') | Out-Null
+    }
+}
+function Get-ArgsFromCommandLine([string]$cl) {
+    if (-not $cl) { return '' }
+    $cl = $cl.Trim()
+    if ($cl.StartsWith('"')) { $i = $cl.IndexOf('"', 1); if ($i -gt 0) { return $cl.Substring($i + 1).Trim() } }
+    $i = $cl.IndexOf(' '); if ($i -gt 0) { return $cl.Substring($i + 1).Trim() }
+    return ''
+}
+function Restart-ProcessRow($r) {
+    if (-not $r) { return }
+    if ($r.ServiceNames) {
+        $ans = [System.Windows.MessageBox]::Show("Restart service(s) $($r.ServiceNames)?", 'Restart service', 'YesNo', 'Question')
+        if ($ans -ne 'Yes') { return }
+        foreach ($svc in ($r.ServiceNames -split ',')) { try { Restart-Service -Name $svc.Trim() -Force -ErrorAction Stop } catch { [System.Windows.MessageBox]::Show($_.Exception.Message, 'Restart service', 'OK', 'Error') | Out-Null } }
+        Load-Processes; return
+    }
+    if (-not $r.Path) { Show-Status 'Path unknown - cannot restart (try Restart as Administrator).'; return }
+    $arguments = Get-ArgsFromCommandLine $r.CommandLine
+    if (-not (Stop-Targets @($r))) { return }
+    Start-Sleep -Milliseconds 300
+    try {
+        if ($arguments) { Start-Process -FilePath $r.Path -ArgumentList $arguments -ErrorAction Stop }
+        else            { Start-Process -FilePath $r.Path -ErrorAction Stop }
+    } catch { [System.Windows.MessageBox]::Show("Ended, but could not start it again:`n$($_.Exception.Message)", 'Restart process', 'OK', 'Error') | Out-Null }
+    Load-Processes
+}
+function Start-AsOtherUser($r) {
+    if (-not $r -or -not $r.Path) { Show-Status 'Path unknown.'; return }
+    try { Start-Process -FilePath $r.Path -Verb RunAsUser -ErrorAction Stop }
+    catch { [System.Windows.MessageBox]::Show($_.Exception.Message, 'Run as different user', 'OK', 'Error') | Out-Null }
+}
+function Open-VirusTotal([string]$p) {
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { Show-Status 'Path unknown.'; return }
+    try {
+        Show-Status 'Hashing file...'
+        $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+        Copy-Text $h
+        Start-Process "https://www.virustotal.com/gui/file/$h"
+        Show-Status "SHA-256 copied to clipboard and opened on VirusTotal: $h"
+    } catch { Show-Status "Could not hash: $($_.Exception.Message)" }
+}
+
 # =============================================================================
 # Right-click menus + keyboard shortcuts
 # =============================================================================
@@ -930,14 +1435,24 @@ $ui.gridProcs.ContextMenu = New-ContextMenu @(
     @{ Header = 'Stop hosted service(s)';      Key = 'p.svc'
        Action = { if (Stop-Targets @($ui.gridProcs.SelectedItems)) { Load-Processes } } }
     '-'
+    @{ Header = 'Restart process';             Key = 'p.restart'
+       Action = { Restart-ProcessRow $ui.gridProcs.SelectedItem } }
+    '-'
     @{ Header = 'Show files this process is using'; Key = 'p.files'
        Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Goto-Files $r.PID } } }
+    @{ Header = 'Show network connections';    Key = 'p.net'
+       Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Goto-Net $r.PID } } }
     @{ Header = 'Go to parent process';        Key = 'p.parent'
        Action = { $r = $ui.gridProcs.SelectedItem; if ($r -and $r.ParentPID -gt 0) { Goto-Process $r.ParentPID } } }
     @{ Header = 'Open file location';          Key = 'p.loc'
        Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Open-Location $r.Path } } }
+    '-'
+    @{ Header = 'Check file on VirusTotal';    Key = 'p.vt'
+       Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Open-VirusTotal $r.Path } } }
     @{ Header = 'Search online for this process'
        Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Search-Online $r.Name } } }
+    @{ Header = 'Run as different user...';    Key = 'p.runas'
+       Action = { Start-AsOtherUser $ui.gridProcs.SelectedItem } }
     '-'
     @{ Header = 'Copy PID';          Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Copy-Text ([string]$r.PID) } } }
     @{ Header = 'Copy name';         Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Copy-Text $r.Name } } }
@@ -945,6 +1460,8 @@ $ui.gridProcs.ContextMenu = New-ContextMenu @(
     @{ Header = 'Copy command line'; Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { Copy-Text $r.CommandLine } } }
     @{ Header = 'Copy selected row(s)'; Gesture = 'Ctrl+C'
        Action = { $t = (@($ui.gridProcs.SelectedItems) | ForEach-Object { "$($_.PID)`t$($_.Name)`t$($_.Description)`t$($_.User)`t$($_.UsedBy)`t$($_.Path)" }) -join "`n"; Copy-Text $t } }
+    @{ Header = 'Copy as table (with headers)'; Action = { Copy-GridTable $ui.gridProcs } }
+    @{ Header = 'Export list to CSV...';        Action = { Export-Grid $ui.gridProcs 'processes' } }
     '-'
     @{ Header = 'Properties';        Action = { $r = $ui.gridProcs.SelectedItem; if ($r) { [System.Windows.MessageBox]::Show($ui.txtDetails.Text, "$($r.Name) ($($r.PID))", 'OK', 'Information') | Out-Null } } }
     @{ Header = 'Refresh list'; Gesture = 'F5'; Action = { Load-Processes } }
@@ -952,12 +1469,15 @@ $ui.gridProcs.ContextMenu = New-ContextMenu @(
 $ui.gridProcs.Add_PreviewMouseRightButtonDown({ param($s, $e) Select-RowUnderMouse $ui.gridProcs $e })
 $ui.gridProcs.Add_ContextMenuOpening({
     $r = $ui.gridProcs.SelectedItem
-    $has = $null -ne $r
-    foreach ($k in 'p.end','p.tree','p.files','p.loc','p.parent') { $MenuItems[$k].IsEnabled = $has }
+    $has = ($null -ne $r) -and ($r.Status -ne 'Exited')
+    foreach ($k in 'p.end','p.tree','p.files','p.net','p.loc','p.parent','p.restart','p.runas','p.vt') { $MenuItems[$k].IsEnabled = $has }
     $MenuItems['p.svc'].Visibility    = if ($has -and $r.ServiceNames) { 'Visible' } else { 'Collapsed' }
     $MenuItems['p.tree'].IsEnabled    = $has -and ((Get-Descendants $r.PID).Count -gt 0)
     $MenuItems['p.parent'].IsEnabled  = $has -and $r.ParentPID -gt 0
     $MenuItems['p.loc'].IsEnabled     = $has -and [bool]$r.Path
+    $MenuItems['p.vt'].IsEnabled      = $has -and [bool]$r.Path
+    $MenuItems['p.runas'].IsEnabled   = $has -and [bool]$r.Path
+    $MenuItems['p.restart'].IsEnabled = $has -and ([bool]$r.Path -or [bool]$r.ServiceNames)
 })
 $ui.gridProcs.Add_PreviewKeyDown({ param($s, $e)
     if ($e.Key -eq 'Delete') { $e.Handled = $true; if (Stop-Targets @($ui.gridProcs.SelectedItems)) { Load-Processes } }
@@ -966,11 +1486,15 @@ $ui.gridProcs.Add_PreviewKeyDown({ param($s, $e)
 # ---- Files used by selected process (Processes tab) -------------------------------
 $ui.gridFiles.ContextMenu = New-ContextMenu @(
     @{ Header = "Who's locking this file?"; Bold = $true; Action = { $r = $ui.gridFiles.SelectedItem; if ($r) { Goto-Lock $r.File } } }
+    @{ Header = 'Release this file (close the handle, keep the program running)'; Key = 'f.close'
+       Action = { $r = $ui.gridFiles.SelectedItem; if ($r -and $r.Handle) { if (Close-RemoteHandles $r.PID $r.Process @($r.Handle) $r.File) { Load-SelectedFiles } } } }
     @{ Header = 'Open file location';       Action = { $r = $ui.gridFiles.SelectedItem; if ($r) { Open-Location $r.File } } }
     '-'
     @{ Header = 'Copy path';                Action = { $r = $ui.gridFiles.SelectedItem; if ($r) { Copy-Text $r.File } } }
     @{ Header = 'Copy all listed paths';    Action = { if ($ui.gridFiles.ItemsSource) { Copy-Text ((@($ui.gridFiles.ItemsSource) | ForEach-Object { $_.File }) -join "`n") } } }
+    @{ Header = 'Export list to CSV...';    Action = { Export-Grid $ui.gridFiles 'files' } }
 )
+$ui.gridFiles.Add_ContextMenuOpening({ $r = $ui.gridFiles.SelectedItem; $MenuItems['f.close'].IsEnabled = ($r -and $r.Handle -ne 0) })
 $ui.gridFiles.Add_PreviewMouseRightButtonDown({ param($s, $e) Select-RowUnderMouse $ui.gridFiles $e })
 
 # ---- Open files tab grid ----------------------------------------------------------
@@ -986,17 +1510,28 @@ $ui.gridAllFiles.ContextMenu = New-ContextMenu @(
     '-'
     @{ Header = 'Copy path';                Action = { $r = $ui.gridAllFiles.SelectedItem; if ($r) { Copy-Text $r.File } } }
     @{ Header = 'Copy PID';                 Action = { $r = $ui.gridAllFiles.SelectedItem; if ($r) { Copy-Text ([string]$r.PID) } } }
+    @{ Header = 'Release this file (close the handle, keep the program running)'; Key = 'a.close'
+       Action = { $r = $ui.gridAllFiles.SelectedItem; if ($r -and $r.Handle) { if (Close-RemoteHandles $r.PID $r.Process @($r.Handle) $r.File) { Load-AllFiles } } } }
+    '-'
     @{ Header = 'Copy selected row(s)'; Gesture = 'Ctrl+C'
        Action = { Copy-Text ((@($ui.gridAllFiles.SelectedItems) | ForEach-Object { "$($_.PID)`t$($_.Process)`t$($_.Kind)`t$($_.File)" }) -join "`n") } }
+    @{ Header = 'Copy as table (with headers)'; Action = { Copy-GridTable $ui.gridAllFiles } }
+    @{ Header = 'Export list to CSV...';    Action = { Export-Grid $ui.gridAllFiles 'open-files' } }
     '-'
     @{ Header = 'Refresh'; Gesture = 'F5';  Action = { Load-AllFiles } }
 )
 $ui.gridAllFiles.Add_PreviewMouseRightButtonDown({ param($s, $e) Select-RowUnderMouse $ui.gridAllFiles $e })
+$ui.gridAllFiles.Add_ContextMenuOpening({ $r = $ui.gridAllFiles.SelectedItem; $MenuItems['a.close'].IsEnabled = ($r -and $r.Handle -ne 0) })
 
 # ---- Lock tab grid ----------------------------------------------------------------
 $ui.gridLock.ContextMenu = New-ContextMenu @(
     @{ Header = 'End process / stop service'; Bold = $true; Gesture = 'Del'
        Action = { if (Stop-Targets @($ui.gridLock.SelectedItems)) { Run-LockCheck } } }
+    @{ Header = 'Release the file only (close its handle, keep the program running)'; Key = 'l.close'
+       Action = { $r = $ui.gridLock.SelectedItem; if ($r) { if (Close-RemoteHandles $r.PID $r.Name $r.Handles $r.HeldItem) { Run-LockCheck } } } }
+    @{ Header = 'Delete this path on next reboot...'; Key = 'l.reboot'
+       Action = { Schedule-DeleteOnReboot ($ui.txtPath.Text.Trim().Trim('"')) } }
+    '-'
     @{ Header = 'Show in Processes tab';    Action = { $r = $ui.gridLock.SelectedItem; if ($r) { Goto-Process $r.PID } } }
     @{ Header = 'Show all files this process is using'; Action = { $r = $ui.gridLock.SelectedItem; if ($r) { Goto-Files $r.PID } } }
     @{ Header = 'Open file location';       Action = { $r = $ui.gridLock.SelectedItem; if ($r) { Open-Location $r.Path } } }
@@ -1004,10 +1539,34 @@ $ui.gridLock.ContextMenu = New-ContextMenu @(
     '-'
     @{ Header = 'Copy PID';                 Action = { $r = $ui.gridLock.SelectedItem; if ($r) { Copy-Text ([string]$r.PID) } } }
     @{ Header = 'Copy path';                Action = { $r = $ui.gridLock.SelectedItem; if ($r) { Copy-Text $r.Path } } }
+    @{ Header = 'Export list to CSV...';    Action = { Export-Grid $ui.gridLock 'locks' } }
     '-'
     @{ Header = 'Check again'; Gesture = 'F5'; Action = { Run-LockCheck } }
 )
 $ui.gridLock.Add_PreviewMouseRightButtonDown({ param($s, $e) Select-RowUnderMouse $ui.gridLock $e })
+$ui.gridLock.Add_ContextMenuOpening({
+    $r = $ui.gridLock.SelectedItem
+    $MenuItems['l.close'].IsEnabled = ($r -and $r.Handles.Count -gt 0)
+    $MenuItems['l.reboot'].IsEnabled = [bool](Test-Path -LiteralPath ($ui.txtPath.Text.Trim().Trim('"')) -ErrorAction SilentlyContinue)
+})
+
+# ---- Network grid ----------------------------------------------------------------------
+$ui.gridNet.ContextMenu = New-ContextMenu @(
+    @{ Header = 'Go to process';            Bold = $true; Action = { $r = $ui.gridNet.SelectedItem; if ($r) { Goto-Process $r.PID } } }
+    @{ Header = 'End the process';          Action = {
+           $r = $ui.gridNet.SelectedItem; if (-not $r -or $r.PID -le 4) { return }
+           $p = $AllProcs | Where-Object { $_.PID -eq $r.PID } | Select-Object -First 1
+           if (-not $p) { $p = [pscustomobject]@{ PID = $r.PID; Name = $r.Process; ServiceNames = '' } }
+           if (Stop-Targets @($p)) { Load-Net } } }
+    '-'
+    @{ Header = 'Copy remote address';      Action = { $r = $ui.gridNet.SelectedItem; if ($r) { Copy-Text "$($r.RemoteAddr):$($r.RemotePort)" } } }
+    @{ Header = 'Look up remote address online'; Action = { $r = $ui.gridNet.SelectedItem; if ($r -and $r.RemoteAddr -and $r.RemoteAddr -ne '*') { Start-Process "https://www.google.com/search?q=$([uri]::EscapeDataString($r.RemoteAddr + ' ip address'))" } } }
+    @{ Header = 'Copy as table (with headers)'; Action = { Copy-GridTable $ui.gridNet } }
+    @{ Header = 'Export list to CSV...';    Action = { Export-Grid $ui.gridNet 'network' } }
+    '-'
+    @{ Header = 'Refresh'; Gesture = 'F5';  Action = { Load-Net } }
+)
+$ui.gridNet.Add_PreviewMouseRightButtonDown({ param($s, $e) Select-RowUnderMouse $ui.gridNet $e })
 $ui.gridLock.Add_PreviewKeyDown({ param($s, $e)
     if ($e.Key -eq 'Delete') { $e.Handled = $true; if (Stop-Targets @($ui.gridLock.SelectedItems)) { Run-LockCheck } }
 })
@@ -1016,11 +1575,11 @@ $ui.gridLock.Add_PreviewKeyDown({ param($s, $e)
 $window.Add_PreviewKeyDown({ param($s, $e)
     if ($e.Key -eq 'F5') {
         $e.Handled = $true
-        switch ($ui.tabs.SelectedIndex) { 0 { Load-Processes } 1 { Load-AllFiles } 2 { Run-LockCheck } }
+        switch ($ui.tabs.SelectedIndex) { 0 { Load-Processes } 1 { Load-AllFiles } 2 { Run-LockCheck } 3 { Load-Net } }
     }
     elseif ($e.Key -eq 'F' -and $e.KeyboardDevice.Modifiers -eq 'Control') {
         $e.Handled = $true
-        switch ($ui.tabs.SelectedIndex) { 0 { $ui.txtSearch.Focus() } 1 { $ui.txtFileSearch.Focus() } 2 { $ui.txtPath.Focus() } }
+        switch ($ui.tabs.SelectedIndex) { 0 { $ui.txtSearch.Focus() } 1 { $ui.txtFileSearch.Focus() } 2 { $ui.txtPath.Focus() } 3 { $ui.txtNetSearch.Focus() } }
     }
 })
 
@@ -1049,7 +1608,20 @@ if ($SelfTest) {
     }
     $sel = $ui.gridProcs.SelectedItem
     Write-Host "SelfTest descendants of $($sel.Name): $((Get-Descendants $sel.PID).Count)"
+    $t = Measure-Command { Update-Signers }
+    $signed = @($AllProcs | Where-Object { $_.Signer -and $_.Signer -ne 'Unsigned' -and $_.Signer -notlike 'Invalid*' }).Count
+    Write-Host "SelfTest signers: $signed signed of $(@($AllProcs | Where-Object { $_.Path }).Count) with a path, in $([int]$t.TotalMilliseconds) ms; explorer -> '$($sel.Signer)'"
+    Load-Net
+    Write-Host "SelfTest network: $($ui.txtNetInfo.Text)"
+    Start-Sleep -Milliseconds 600; Load-Processes
+    $withCpu = @($AllProcs | Where-Object { $_.CpuPercent -gt 0 }).Count
+    Write-Host "SelfTest cpu: $withCpu process(es) with CPU > 0 after second refresh; exited rows: $(@($AllProcs | Where-Object { $_.Status -eq 'Exited' }).Count)"
+    Write-Host "SelfTest args: [$(Get-ArgsFromCommandLine '"C:\Program Files\x y\a.exe" --flag "v w"')] [$(Get-ArgsFromCommandLine 'notepad.exe c:\t.txt')] [$(Get-ArgsFromCommandLine '"C:\a.exe"')]"
     if ($Screenshot) {
+        if ($Dark) {
+            try { Set-Theme $true; $ui.chkDark.IsChecked = $true }
+            catch { Write-Host "SelfTest theme error: $($_.Exception.ToString())`n$($_.ScriptStackTrace)"; throw }
+        }
         if ($ShowTab -ge 0) { $ui.tabs.SelectedIndex = $ShowTab }
         $window.WindowStartupLocation = 'Manual'; $window.Left = -5000; $window.Top = -5000   # off-screen
         $window.Show()
@@ -1087,7 +1659,7 @@ function Show-MainWindow {
     $window.Activate() | Out-Null
     if ($wasHidden -and $Loaded) {
         # re-opened from the tray: refresh in the background so the list is current
-        $window.Dispatcher.BeginInvoke([action]{ Load-Processes }, 'Background') | Out-Null
+        $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{ Load-Processes }) | Out-Null
     }
 }
 function Exit-App {
@@ -1135,6 +1707,7 @@ $window.Add_ContentRendered({
     if ($Path) { Run-LockCheck }
 })
 $window.Add_Closing({ param($s, $e)
+    Save-Settings
     if ($TrayMode -and -not $Exiting) {
         $e.Cancel = $true
         $window.Hide()
@@ -1146,5 +1719,7 @@ $window.Add_Closing({ param($s, $e)
 })
 $window.Add_Closed({ Stop-App })
 
+Apply-Settings
+if ($ui.chkAutoRefresh.IsChecked) { $AutoTimer.Start() }
 if ($TrayMode -and -not $Show) { <# stay hidden until the tray icon is clicked #> } else { $window.Show() }
 $app.Run() | Out-Null

@@ -1,0 +1,25 @@
+﻿# Submit to https://github.com/microsoft/winget-pkgs under manifests/f/furiouskopan/ProcessInspector/1.1.0/
+PackageIdentifier: furiouskopan.ProcessInspector
+PackageVersion: 1.1.0
+PackageName: Process Inspector
+Publisher: furiouskopan
+License: MIT
+LicenseUrl: https://github.com/furiouskopan/process-inspector/blob/main/LICENSE
+ShortDescription: See what every process is used by, which files it has open, and who is locking a file.
+PackageUrl: https://github.com/furiouskopan/process-inspector
+Tags:
+- process
+- handle
+- unlocker
+- file-in-use
+Installers:
+- Architecture: x64
+  InstallerType: exe
+  Scope: user
+  InstallerUrl: https://github.com/furiouskopan/process-inspector/releases/download/v1.1.0/ProcessInspector-Setup.exe
+  InstallerSha256: 9733DAC0F0BA454C56788BF74E6FD28CC1E201886B6D992B689C3CC48E78A45E
+  InstallerSwitches:
+    Silent: -Silent -NoLaunch
+    SilentWithProgress: -Silent -NoLaunch
+ManifestType: singleton
+ManifestVersion: 1.6.0
