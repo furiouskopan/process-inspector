@@ -23,7 +23,11 @@ that talks to the Windows Restart Manager and the kernel handle table, wrapped i
   file, folder or process name. Double-click to jump to the process.
 - **Who's locking a file?** – drop a file or folder on the box (or use *File… / Folder…*).
   Uses the Restart Manager API, so it catches open handles *and* loaded EXE/DLL images.
+  For folders it also scans the handle table, which catches the classic "a console window has
+  this folder as its current directory" case and shows exactly which item is held.
   End the process or stop the service right there.
+- **Single instance** – starting it again (Desktop shortcut, right-click menu, command line)
+  brings the running window to the front and hands over the path instead of opening a second copy.
 - **Right-click menus** on every list: end process, end process tree, stop hosted service, show files
   used, go to parent, open file location, search online, copy PID/name/path/command line, properties.
   `Del` ends, `F5` refreshes, `Ctrl+F` focuses search, `Ctrl+C` copies rows.
