@@ -17,7 +17,7 @@ Installers:
   InstallerType: exe
   Scope: user
   InstallerUrl: https://github.com/furiouskopan/process-inspector/releases/download/v1.2.1/ProcessInspector-Setup.exe
-  InstallerSha256: 0E47BF30A7BB735264EF94053CB13D22F9A442B8A92F1B2977F6C7E62045B23B
+  InstallerSha256: BDE827E8777FA91760D93D3070945B1BCB037F4AA16DE38F2177621EF4F0CBFE
   InstallerSwitches:
     Silent: -Silent -NoLaunch
     SilentWithProgress: -Silent -NoLaunch

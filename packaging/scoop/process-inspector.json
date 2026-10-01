@@ -4,7 +4,7 @@
     "homepage": "https://github.com/furiouskopan/process-inspector",
     "license": "MIT",
     "url": "https://github.com/furiouskopan/process-inspector/releases/download/v1.2.1/ProcessInspector-portable.zip",
-    "hash": "cd7073de520a950d9c6678f6f299331e2cd882897575b97f5d671a86afabbc59",
+    "hash": "e1913744a028d1a55f5f43625957bf6933dc648215253d01529db46f497f2b1f",
     "bin": "ProcessInspector.exe",
     "shortcuts": [ [ "ProcessInspector.exe", "Process Inspector" ] ],
     "checkver": "github",
